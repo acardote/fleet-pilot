@@ -643,7 +643,7 @@ def pr_obj(n, head, labels=("auto-merge", "weight:standard"), repo=REPO, state="
 
 
 VERDICT_RUNS_RE = re.compile(rf"repos/{REPO}/actions/workflows/verdict\.yml/runs\?head_sha=([0-9a-f]{{40}})"
-                             r"&event=pull_request_target")
+                             r"&event=pull_request_target&per_page=100")
 
 
 def vrun(head, rid=900, status="completed", conclusion="success", path=".github/workflows/verdict.yml",
@@ -668,6 +668,10 @@ class FakeGH:
 
     def get(self, path):
         self.calls.append(path)
+        mm = VERDICT_RUNS_RE.fullmatch(path)
+        if mm:
+            self.vreads += 1
+            return {"total_count": 1, "workflow_runs": self.verdict_runs(mm.group(1), self.vreads - 1)}
         if path == f"repos/{REPO}":
             return {"default_branch": "main"}
         mm = re.fullmatch(rf"repos/{REPO}/pulls/(\d+)", path)
@@ -682,11 +686,6 @@ class FakeGH:
 
     def paged(self, path, key=None, limit=100):
         self.calls.append(path)
-        mm = VERDICT_RUNS_RE.fullmatch(path)
-        if mm:
-            assert key == "workflow_runs"
-            self.vreads += 1
-            return self.verdict_runs(mm.group(1), self.vreads - 1)
         if path.startswith(f"repos/{REPO}/pulls?state=open&base=main"):
             return list(self.prs.values())
         mm = re.fullmatch(rf"repos/{REPO}/issues/(\d+)/labels", path)
@@ -882,6 +881,9 @@ class VerdictGH(FakeGH):
         return p
 
     def get(self, path):
+        mm = VERDICT_RUNS_RE.fullmatch(path)
+        if mm:
+            return {"workflow_runs": [vrun(mm.group(1))]}
         if path == f"repos/{REPO}/pulls/1":
             self.calls.append(path)
             return self.full_pr()
@@ -894,9 +896,6 @@ class VerdictGH(FakeGH):
         return super().get(path)
 
     def paged(self, path, key=None, limit=100):
-        mm = VERDICT_RUNS_RE.fullmatch(path)
-        if mm:
-            return [vrun(mm.group(1))]
         if path.endswith("/pulls/1/files"):
             return [{"filename": "src/app.py", "status": "modified", "additions": 1, "deletions": 1,
                      "patch": "@@ -1 +1 @@"}]
@@ -1241,7 +1240,9 @@ def test_waits_for_a_pending_verdict_check_then_merges(origin, capsys):
     assert clock.sleeps == [10, 10, 10]
     assert f"CHECK-WAIT pr=1 head={h} state=success run=901" in out
     v, mg = contract_lines(out, 1, h)
-    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"] and len(mg) == 1
+    # it waited, so steps 4 and 5 ran again: a second, identical-format VERDICT-RECOMPUTED line
+    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"] * 2 and len(mg) == 1
+    assert out.count("7A-DERIVE base=") == 2 and f"RE-VERIFY pr=1 head={h} attempt=1 waited=30s" in out
     assert AUDIT_MERGED_RE.fullmatch(mg[0])
 
 
@@ -1263,7 +1264,8 @@ def test_policy_refusal_while_check_is_recreated_is_retried_in_run(origin, capsy
     assert f"MERGE-RETRY pr=1 head={h} kind=check-stale" in out
     assert "MERGE-REFUSED" not in out
     v, mg = contract_lines(out, 1, h)
-    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"]
+    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"] * 2  # the retry re-verifies
+    assert f"RE-VERIFY pr=1 head={h} attempt=2" in out
     assert mg == [f"MERGED pr=1 head={h} run_id=4242 workflow_ref={REF}"]
     assert "RUN-RESULT merged=1 skipped=0 error=0 refused=0" in out
 
@@ -1294,10 +1296,10 @@ def test_never_merges_past_a_non_success_check(origin, capsys, conclusion):
     h = origin.heads[1]
     runs = lambda head, i: [vrun(head, 900), vrun(head, 901, "completed", conclusion)]  # noqa: E731
     r, merges, _ = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=runs)
-    assert r.run("true") == 1
+    assert r.run("true") == 0  # skipped, not red every cycle (fp17 challenger M2)
     out = capsys.readouterr().out
     assert merges == []
-    assert f'review-verdict check at H concluded "{conclusion}"' in out
+    assert f'outcome=skipped reason=review-verdict check at H concluded "{conclusion}"' in out
     v, mg = contract_lines(out, 1, h)
     assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"] and mg == []
 
@@ -1337,7 +1339,7 @@ def test_wait_budget_bounds_the_whole_run(origin, capsys):
     runs = lambda head, i: [vrun(head, 901, "queued")]  # noqa: E731
     r, merges, clock = race_runner(origin, prs, [], verdict_runs=runs)
     assert r.run("true") == 1
-    assert merges == [] and sum(clock.sleeps) <= m.VERDICT_WAIT_BUDGET_S
+    assert merges == [] and sum(clock.sleeps) <= m.RUN_DEADLINE_S
     capsys.readouterr()
 
 
@@ -1375,3 +1377,83 @@ def test_unreadable_check_state_fails_closed(origin, capsys):
 def test_merge_workflow_can_read_actions_runs(wf):
     # step 7 reads verdict.yml runs through the Actions API: needs actions: read, nothing more
     assert wf["jobs"]["auto-merge"]["permissions"]["actions"] == "read"
+
+
+def test_no_wait_means_no_reverification(origin, capsys):
+    h = origin.heads[1]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(True, "")])
+    assert r.run("true") == 0
+    out = capsys.readouterr().out
+    assert clock.sleeps == [] and "RE-VERIFY" not in out and out.count("VERDICT-RECOMPUTED") == 1
+
+
+def test_critical_posted_during_the_wait_stops_the_merge(origin, capsys):
+    """fp17 challenger I1(a): the verdict is recomputed after the wait, not reused."""
+    h = origin.heads[1]
+    results = iter([True, False])  # pass before the wait; a CRITICAL record lands during it
+
+    def fetch_and_compute(gh, repo, n, cfg):
+        ok = next(results)
+        return V.Result(passed=ok, head_sha=h, weight="standard", reasons=[] if ok else ["critical finding open"])
+    v = SimpleNamespace(fetch_and_compute=fetch_and_compute, Result=V.Result, matches_any=V.matches_any,
+                        VerdictError=V.VerdictError)
+    runs = lambda head, i: [vrun(head, 901, "in_progress" if i < 2 else "completed")]  # noqa: E731
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=runs, verdict=v)
+    assert r.run("true") == 0
+    out = capsys.readouterr().out
+    assert merges == []
+    v_lines, mg = contract_lines(out, 1, h)
+    assert v_lines == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass", f"VERDICT-RECOMPUTED pr=1 head={h} result=fail"]
+    assert mg == [] and "VERDICT-DETAIL pr=1 FAIL: critical finding open" in out
+
+
+def test_7a_change_landing_on_main_during_the_wait_stops_the_run(origin, capsys):
+    """fp17 challenger I1(c): the base tip is re-fetched and the definition re-checked after the wait."""
+    h = origin.heads[1]
+    w = origin.work
+
+    def runs(head, i):
+        if i == 0:  # during the wait, main gains a 7a change the run's definition lacks
+            (w / "tools" / "check.sh").write_text("echo tightened\n")
+            git(w, "commit", "-q", "-am", "7a change during the wait")
+            return [vrun(head, 901, "in_progress")]
+        return [vrun(head, 901)]
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=runs)
+    assert r.run("true") == 0
+    out = capsys.readouterr().out
+    assert merges == [] and "STALE-DEFINITION" in out and out.count("7A-DERIVE base=") == 2  # re-derived
+
+
+def test_no_merge_call_after_the_run_deadline(origin, capsys):
+    """AUTO_MERGE_ENABLED cannot be re-read in-run, so the deadline bounds the kill-switch latency."""
+    h = origin.heads[1]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(True, "")])
+    orig = r.verify
+
+    def slow_verify(n, head, branch):
+        clock.t += m.RUN_DEADLINE_S + 1  # the run spent its deadline on earlier work
+        return orig(n, head, branch)
+    r.verify = slow_verify
+    assert r.run("true") == 0
+    out = capsys.readouterr().out
+    assert merges == [] and f"run deadline {m.RUN_DEADLINE_S}s reached before the merge call" in out
+
+
+def test_verdict_runs_read_is_one_page_newest_first(origin, capsys):
+    """fp17 challenger M3: hundreds of runs at one head never error; one page is read."""
+    h = origin.heads[1]
+    runs = lambda head, i: [vrun(head, 2000 - k, "completed", "cancelled" if k else "success")  # noqa: E731
+                            for k in range(100)]
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [(True, "")], verdict_runs=runs)
+    assert r.run("true") == 0 and len(merges) == 1
+    assert "CHECK-WAIT pr=1 head=" + h + " state=success run=2000" in capsys.readouterr().out
+    assert sum(1 for c in r.gh.calls if VERDICT_RUNS_RE.fullmatch(c)) == 1
+
+
+def test_malformed_verdict_runs_response_fails_closed(origin, capsys):
+    h = origin.heads[1]
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [])
+    orig = r.gh.get
+    r.gh.get = lambda path: {"message": "nope"} if VERDICT_RUNS_RE.fullmatch(path) else orig(path)
+    assert r.run("true") == 1
+    assert merges == [] and "cannot read the review-verdict check (fail closed)" in capsys.readouterr().out

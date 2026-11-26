@@ -38,11 +38,22 @@ Per run (.github/workflows/merge.yml calls this from the default branch only):
      cancels and recreates the `review-verdict` check the e5-main ruleset
      requires; merging while it is pending is refused ("base branch policy
      prohibits the merge"). So, before the merge call, poll the verdict.yml
-     runs at H (bounded: VERDICT_WAIT_S per attempt, VERDICT_WAIT_BUDGET_S per
-     run) until all are completed. The newest must have concluded `success`,
-     or the PR is not merged. This read can only BLOCK a merge, never grant
-     one: the decision is still step 4's inline verdict (E5 recompute-inline
-     rule), and the ruleset enforces the check itself.
+     runs at H (bounded: VERDICT_WAIT_S per attempt, and never past
+     RUN_DEADLINE_S from the start of the run) until all are completed. The
+     newest must have concluded `success`, or the PR is not merged (skipped,
+     not red: verdict.yml re-runs only on a PR event). This read can only
+     BLOCK a merge, never grant one: the decision is still step 4's inline
+     verdict (E5 recompute-inline rule), and the ruleset enforces the check.
+     If step 7 waited at all, steps 4 and 5 run again before the merge (a new
+     VERDICT-RECOMPUTED line, the base tip re-fetched, the 7a set and the
+     stale-definition test re-derived): a CRITICAL record posted, or a 7a
+     change landed, during the wait stops the merge.
+     Kill-switch latency: the variable AUTO_MERGE_ENABLED is read once, from
+     the `vars` context at step start, and the job token cannot re-read it
+     (GITHUB_TOKEN has no Variables permission). So no merge call is made
+     after RUN_DEADLINE_S from the start of the run; that bounds how long an
+     in-flight run can merge after the operator flips the variable. The
+     do-not-auto-merge label is re-read before every merge call (step 6).
   8. Merge: `gh pr merge <n> --squash --match-head-commit H`. If the call fails
      or times out, the PR is re-read: merged at H by merger_login counts as
      merged (MERGE-CONFIRMED + MERGED). A refusal caused by the check
@@ -1889,7 +1900,8 @@ VERDICT_PATH = ".github/workflows/verdict.yml"
 VERDICT_WAIT_S = 120         # per attempt, while a verdict.yml run at H is queued or in progress
 VERDICT_NONE_GRACE_S = 30    # per attempt, while no verdict.yml run at H exists yet
 VERDICT_POLL_S = 10
-VERDICT_WAIT_BUDGET_S = 600  # whole run (the job's timeout is 20 minutes)
+VERDICT_RUNS_PAGE = 100      # newest verdict.yml runs at H read (one page, newest first)
+RUN_DEADLINE_S = 600         # no wait and no merge call after this, from run start (job timeout: 20 minutes)
 
 
 def is_check_refusal(msg: str) -> bool:
@@ -1912,7 +1924,7 @@ class Runner:
         self.patterns: list[str] | None = None
         self.sleep = sleep
         self.clock = clock
-        self.wait_budget = float(VERDICT_WAIT_BUDGET_S)
+        self.started = clock()  # reset at the start of run()
 
     def skip(self, n: int, head: str, reason: str, outcome: str = SKIPPED) -> str:
         log(f"SKIP pr={n} head={head} outcome={outcome} reason={reason}")
@@ -1962,8 +1974,14 @@ class Runner:
         verdict.yml at H count; the newest run (highest id) is the one the ruleset sees
         once every run is completed. A forged or foreign run can only make this wait or
         refuse: it never grants a merge (step 4 and the ruleset do)."""
-        runs = self.gh.paged(f"repos/{self.ctx.repo}/actions/workflows/{VERDICT_WORKFLOW}/runs"
-                             f"?head_sha={head}&event=pull_request_target", key="workflow_runs", limit=2)
+        # One page, newest first: never raises on a head with hundreds of (label-toggled) runs. An older
+        # run beyond the page cannot be the newest, and a pending one there would also be pending here
+        # only if it were new, so reading the newest page is enough to see what the ruleset sees.
+        page = self.gh.get(f"repos/{self.ctx.repo}/actions/workflows/{VERDICT_WORKFLOW}/runs"
+                           f"?head_sha={head}&event=pull_request_target&per_page={VERDICT_RUNS_PAGE}")
+        runs = page.get("workflow_runs") if isinstance(page, dict) else None
+        if not isinstance(runs, list):
+            raise ValueError("verdict.yml runs: unexpected response shape")
         mine = [r for r in runs if isinstance(r, dict) and r.get("path") == VERDICT_PATH
                 and r.get("head_sha") == head and r.get("event") == "pull_request_target"
                 and isinstance(r.get("id"), int)]
@@ -1975,22 +1993,27 @@ class Runner:
         concl = str(newest.get("conclusion"))
         return ("success" if concl == "success" else "concluded"), newest["id"], concl
 
-    def await_verdict_check(self, n: int, head: str) -> tuple[str, int | None, str]:
-        """Poll verdict_check_state until it settles, bounded per attempt and per run."""
+    def past_deadline(self, extra: float = 0) -> bool:
+        return self.clock() - self.started + extra > RUN_DEADLINE_S
+
+    def await_verdict_check(self, n: int, head: str) -> tuple[str, int | None, str, float]:
+        """Poll verdict_check_state until it settles, bounded per attempt and by the run deadline.
+        Returns (state, newest run id, conclusion, seconds slept); 0 means it did not wait."""
         start = self.clock()
+        slept = 0.0
         while True:
             state, rid, concl = self.verdict_check_state(head)
             waited = self.clock() - start
             if state in ("success", "concluded"):
                 log(f"CHECK-WAIT pr={n} head={head} state={state} run={rid} conclusion={q(concl)} waited={waited:.0f}s")
-                return state, rid, concl
+                return state, rid, concl, slept
             limit = VERDICT_NONE_GRACE_S if state == "none" else VERDICT_WAIT_S
-            if waited >= limit or self.wait_budget <= 0:
+            if waited >= limit or self.past_deadline(VERDICT_POLL_S):
                 log(f"CHECK-WAIT pr={n} head={head} state={state} waited={waited:.0f}s gave_up=true "
-                    f"budget_left={max(self.wait_budget, 0):.0f}s")
-                return state, None, ""
+                    f"run_elapsed={self.clock() - self.started:.0f}s")
+                return state, None, "", slept
             self.sleep(VERDICT_POLL_S)
-            self.wait_budget -= VERDICT_POLL_S
+            slept += VERDICT_POLL_S
 
     def confirm_after_failed_merge(self, n: int, head: str, msg: str) -> str | None:
         """A failed or timed-out `gh pr merge` may still have merged: re-read the PR (challenger I2).
@@ -2034,31 +2057,10 @@ class Runner:
                 f"review records; the next run retries, or a PR event (relabel auto-merge) re-runs verdict.yml")
         return REFUSED_
 
-    def process(self, n: int, branch: str) -> str:
-        cfg = self.cfg
+    def verify(self, n: int, head: str, branch: str) -> str | None:
+        """Steps 4 and 5 at H. Returns the skip outcome, or None when H may merge. Run again after
+        any wait in step 7, so the decision is never older than the wait (fp17 challenger I1)."""
         repo = self.ctx.repo
-        pr = self.gh.get(f"repos/{repo}/pulls/{n}")
-        head = (pr.get("head") or {}).get("sha")
-        if not isinstance(head, str) or not SHA_RE.fullmatch(head):
-            return self.skip(n, "?", "head SHA missing or malformed")
-        log(f"CANDIDATE pr={n} head={head}")
-        try:
-            labels = label_names(pr.get("labels"))
-        except ValueError as e:
-            return self.skip(n, head, q(str(e)))
-        if pr.get("state") != "open":
-            return self.skip(n, head, f"state {q(pr.get('state'))}")
-        if cfg["auto_merge_label"] not in labels:
-            return self.skip(n, head, f"no {q(cfg['auto_merge_label'])} label")
-        if cfg["kill_label"] in labels:
-            return self.skip(n, head, f"{q(cfg['kill_label'])} label present")
-        if cfg["operator_merge_label"] in labels:
-            return self.skip(n, head, f"{q(cfg['operator_merge_label'])} label present (operator merges)")
-        if (((pr.get("head") or {}).get("repo")) or {}).get("full_name") != repo:
-            return self.skip(n, head, "head repository is not this repository (fork PRs are never merged)")
-        if (pr.get("base") or {}).get("ref") != branch:
-            return self.skip(n, head, f"base is not {q(branch)}")
-
         # 4. Verdict, recomputed inline at H.
         outcome_on_fail = SKIPPED
         try:
@@ -2099,21 +2101,60 @@ class Runner:
                 log(f"7A-HIT pr={n} {h}")
             return self.skip(n, head, "touches a 7a path; skip (operator merges)")
         log(f"7A-CLEAR pr={n} head={head} merge_base={mb} files={len(changes)}")
+        return None
+
+
+    def process(self, n: int, branch: str) -> str:
+        cfg = self.cfg
+        repo = self.ctx.repo
+        pr = self.gh.get(f"repos/{repo}/pulls/{n}")
+        head = (pr.get("head") or {}).get("sha")
+        if not isinstance(head, str) or not SHA_RE.fullmatch(head):
+            return self.skip(n, "?", "head SHA missing or malformed")
+        log(f"CANDIDATE pr={n} head={head}")
+        try:
+            labels = label_names(pr.get("labels"))
+        except ValueError as e:
+            return self.skip(n, head, q(str(e)))
+        if pr.get("state") != "open":
+            return self.skip(n, head, f"state {q(pr.get('state'))}")
+        if cfg["auto_merge_label"] not in labels:
+            return self.skip(n, head, f"no {q(cfg['auto_merge_label'])} label")
+        if cfg["kill_label"] in labels:
+            return self.skip(n, head, f"{q(cfg['kill_label'])} label present")
+        if cfg["operator_merge_label"] in labels:
+            return self.skip(n, head, f"{q(cfg['operator_merge_label'])} label present (operator merges)")
+        if (((pr.get("head") or {}).get("repo")) or {}).get("full_name") != repo:
+            return self.skip(n, head, "head repository is not this repository (fork PRs are never merged)")
+        if (pr.get("base") or {}).get("ref") != branch:
+            return self.skip(n, head, f"base is not {q(branch)}")
+
+        out = self.verify(n, head, branch)
+        if out is not None:
+            return out
 
         for attempt in (1, 2):
             # 7. The required review-verdict check at H (#596): wait for it; never merge past a non-success.
             try:
-                state, rid, concl = self.await_verdict_check(n, head)
+                state, rid, concl, waited = self.await_verdict_check(n, head)
             except Exception as e:  # noqa: BLE001 - fail closed
                 return self.skip(n, head, f"cannot read the review-verdict check (fail closed): "
                                  f"{q(type(e).__name__ + ': ' + str(e))}", ERROR)
             if state == "concluded":
+                # Not red: verdict.yml re-runs only on a PR event, so every later run would be red too.
                 return self.skip(n, head, f"review-verdict check at H concluded {q(concl)} although the inline "
                                  f"verdict passed; it predates the review records: relabel auto-merge to re-run "
-                                 f"verdict.yml", REFUSED_)
+                                 f"verdict.yml")
             if state != "success":
                 return self.skip(n, head, f"review-verdict check at H is {state} after the bounded wait; "
                                  f"the next run retries", REFUSED_)
+            if waited > 0 or attempt > 1:
+                # The world may have moved during the wait: recompute steps 4 and 5 at H before merging.
+                log(f"RE-VERIFY pr={n} head={head} attempt={attempt} waited={waited:.0f}s")
+                self.patterns = None
+                out = self.verify(n, head, branch)
+                if out is not None:
+                    return out
 
             # 6. Label kill switch, head and base, re-read now (again before a retry).
             again = self.gh.get(f"repos/{repo}/pulls/{n}")
@@ -2129,7 +2170,10 @@ class Runner:
             if cfg["auto_merge_label"] not in now_labels or cfg["operator_merge_label"] in now_labels:
                 return self.skip(n, head, "labels changed before merge")
 
-            # 8. Merge, pinned to H.
+            # 8. Merge, pinned to H, but never after the run deadline (bounds the variable kill-switch latency).
+            if self.past_deadline():
+                return self.skip(n, head, f"run deadline {RUN_DEADLINE_S}s reached before the merge call "
+                                 f"(AUTO_MERGE_ENABLED cannot be re-read in-run); the next run retries")
             merged, msg = self.merger(repo, n, head, cfg["merge_method"])
             if merged:
                 log_merged(n, head, self.ctx)
@@ -2147,6 +2191,7 @@ class Runner:
 
     def run(self, kill_value: str | None) -> int:
         ctx = self.ctx
+        self.started = self.clock()
         log(f"PROVENANCE workflow_ref={ctx.workflow_ref} workflow_sha={ctx.workflow_sha} "
             f"run_id={ctx.run_id} event={ctx.event}")
         if not kill_switch_allows(kill_value):
