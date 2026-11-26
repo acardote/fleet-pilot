@@ -58,3 +58,4 @@ Line 55: this PR is over the trivial LOC threshold but is labelled weight:trivia
 Line 56: this PR is over the trivial LOC threshold but is labelled weight:trivial.
 Line 57: this PR is over the trivial LOC threshold but is labelled weight:trivial.
 Line 58: this PR is over the trivial LOC threshold but is labelled weight:trivial.
+Line 59: added after review (stale-SHA test).
