@@ -986,8 +986,9 @@ class Auditor:
                       f"not read (tracked records are still re-verified in rotation)")
         # Oldest update first, so a budget stop leaves the cursor at the last PR read.
         stopped = False
-        for p in sorted(prs, key=lambda x: x.get("updated_at") or ""):
-            if self.over_budget():
+        cap = int(self.cfg["records_review_reads_per_run"])
+        for i, p in enumerate(sorted(prs, key=lambda x: x.get("updated_at") or "")):
+            if i >= cap or self.over_budget():      # a cap of its own: cheap PR edits cannot buy reads
                 stopped = True
                 break
             n = p["number"]
@@ -1216,6 +1217,14 @@ class Auditor:
             cursor["pending"] = [{"id": x.get("id"), "path": clean(x.get("path"), 120), "branch": clean(x.get("head_branch"), 120),
                                   "actor": (x.get("actor") or {}).get("login")} for x in waiting[:50]]
             oldest = waiting[0]
+            age = self.now - (ts(oldest.get("created_at")) or self.now)
+            if age > timedelta(minutes=int(self.cfg["backlog_age_flag_minutes"])):
+                # Evidence that survives a later deletion of that run.
+                self.flag("R5", f"R5:run-unchecked:{oldest.get('id')}",
+                          f"workflow run {oldest.get('id')} ({clean(oldest.get('path'), 120)}, ref "
+                          f"{clean(oldest.get('head_branch'), 80)!r}, actor {(oldest.get('actor') or {}).get('login')!r}, "
+                          f"created {oldest.get('created_at')}) is still unchecked after {int(age.total_seconds() // 60)} "
+                          f"min (R5 backlog); {len(waiting)} run(s) waiting")
             self.backlog("runs", "R5", len(waiting), processed,
                          f"Oldest waiting: run {oldest.get('id')} ({clean(oldest.get('path'), 120)}, ref "
                          f"{clean(oldest.get('head_branch'), 80)!r}, actor {(oldest.get('actor') or {}).get('login')!r}, "

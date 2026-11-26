@@ -1449,7 +1449,7 @@ def test_run_scan_honours_the_api_budget_and_carries_the_rest():
     a = auditor(r)
     a.call_limit = a.gh.count + 3            # listing + default tree + one more, then stop
     cur = a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"})
-    assert "R5:runs-backlog" in a.conditions and a.findings == []
+    assert "R5:runs-backlog" in a.conditions and [f for f in a.findings if not f["key"].startswith("R5:run-unchecked:")] == []
     assert 0 < cur["id"] < 5 and cur["at"] < "2026-11-27T11:05:00Z"
     b = auditor(r)                            # next run, no budget pressure: finishes the rest
     cur2 = b.foreign_runs(cur)
@@ -1518,9 +1518,10 @@ def test_a_backlog_that_persists_becomes_a_flag_naming_the_oldest_run():
         a.call_limit = a.gh.count + 3
         a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"}, bl)
         bl = a.backlogs["runs"]
-        keys += [f["key"] for f in a.findings]
+        keys += [f["key"] for f in a.findings if not f["key"].startswith("R5:run-unchecked:")]
     assert keys == [f"R5:runs-backlog:{CFG['backlog_flag_after']}"]
-    assert "Oldest waiting: run 2" in a.findings[0]["summary"] and "actor 'acardote'" in a.findings[0]["summary"]
+    fl = next(f for f in a.findings if f["key"].startswith("R5:runs-backlog"))
+    assert "Oldest waiting: run 2" in fl["summary"] and "actor 'acardote'" in fl["summary"]
 
 
 def test_a_section_starved_to_zero_is_a_flag_at_once():
@@ -1528,7 +1529,8 @@ def test_a_section_starved_to_zero_is_a_flag_at_once():
     a = auditor(world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": runs}}))
     a.call_limit = a.gh.count            # nothing left
     a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"})
-    assert [f["key"] for f in a.findings] == ["R5:runs-backlog:0"] and "starved" in a.findings[0]["summary"]
+    fl = [f for f in a.findings if f["key"].startswith("R5:runs-backlog")]
+    assert [f["key"] for f in fl] == ["R5:runs-backlog:0"] and "starved" in fl[0]["summary"]
 
 
 def test_a_run_deleted_while_waiting_in_the_backlog_is_flagged():
@@ -1578,3 +1580,26 @@ def test_the_gap_suspect_kind_travels_in_the_witness():
     e = {"seq": 3, "digest": "c" * 64, "run_id": 5, "flags_total": 1,
          "flags": [{"rule": "R6", "key": "R6:runs-gap-suspect:5"}]}
     assert au.witness_line(e).endswith("r6=runs-gap-suspect")
+
+
+
+def test_records_review_reads_have_their_own_cap():
+    """verify5 attack shape: ~250 cheap PR edits per 15 min may not buy unlimited review reads."""
+    prs = [{"number": n, "updated_at": f"2026-11-27T11:{n % 60:02d}:00Z"} for n in range(1, 251)]
+    r = rec_world(**{f"repos/{REPO}/pulls": prs})
+    for p in prs:
+        r[f"repos/{REPO}/pulls/{p['number']}/reviews"] = []
+    a = auditor(r)
+    a.records(None, None)
+    assert sum(1 for c in a.gh.calls if c.endswith("/reviews")) == CFG["records_review_reads_per_run"]
+    assert "R7:records-backlog" in a.conditions
+
+
+def test_an_r5_backlog_older_than_30_minutes_flags_the_oldest_run():
+    """verify5: the evidence (run id, actor) survives a later deletion of that run."""
+    runs = [dict(run_rec(i, sha=D1), created_at="2026-11-27T11:10:00Z") for i in range(1, 4)]
+    a = auditor(world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": runs}, f"repos/{REPO}/git/trees/{D1}": tree(WF_BLOBS)}))
+    a.call_limit = a.gh.count + 3
+    a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"}, {"runs": 0})
+    f = [x for x in a.findings if x["key"].startswith("R5:run-unchecked:")]
+    assert len(f) == 1 and "actor 'acardote'" in f[0]["summary"] and "50 min" in f[0]["summary"]

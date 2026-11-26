@@ -57,5 +57,7 @@
     "branches": 20
   },
   "backlog_flag_after": 3,
-  "retired_workflow_blobs": []
+  "retired_workflow_blobs": [],
+  "records_review_reads_per_run": 40,
+  "backlog_age_flag_minutes": 30
 }
