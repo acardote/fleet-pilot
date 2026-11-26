@@ -65,6 +65,7 @@ class FakeGH(au.GitHub):
 
     def _lookup(self, path: str):
         self.calls.append(path)
+        self.count += 1          # the API budget counts calls, as GitHub._call does
         for key in (path, path.split("?")[0]):
             if key in self.routes:
                 v = self.routes[key]
@@ -683,16 +684,16 @@ GOOD_JOB = {"runner_name": "GitHub Actions 2", "steps": [{"name": "x"}], "run_id
 ])
 def test_forged_checks(cr, job, run, flagged):
     a = auditor(checks_world(cr, job, run))
-    ok, bad = a.forged_checks([], {})
+    ok, bad, _ = a.forged_checks([], {})
     assert bool(a.conditions) is flagged
     assert (77 in ok) is (not flagged and cr["status"] == "completed")
 
 
 def test_forged_check_stays_open_without_refetching():
     a = auditor(checks_world(GOOD_CR, None))
-    ok, bad = a.forged_checks([], {})
+    ok, bad, _ = a.forged_checks([], {})
     b = auditor(checks_world(GOOD_CR, None))
-    b.forged_checks(ok, bad)
+    b.forged_checks(ok, bad, {})
     assert "R4:77" in b.conditions and f"repos/{REPO}/actions/jobs/77" not in b.gh.calls
 
 
@@ -855,11 +856,61 @@ def test_untrusted_artifact_uploader_is_never_the_predecessor():
 
 
 def test_deleted_audit_runs_leave_a_run_number_gap_and_fail_closed():
-    """wario C3: deleting newer runs+artifacts rolls the state back; the run_number gap shows it."""
+    """wario C3: deleting newer runs+artifacts rolls the state back; the run_number gap shows it.
+    challenger2 I3: one listing can lag, so the first sighting is a FLAG and the gap fails closed
+    only when it persists on a later run (>= 5 min)."""
+    state, _ = first_state()
+    loaded, a = load(second_world(state), env(300, 4))
+    assert rules_of(a) == ["R6:runs-gap-suspect"] and a.gap_suspects["numbers"] == [2, 3]
+    s2, *_ = au.run_audit(FakeGH(second_world(state)), REPO, CFG, env(300, 4), {}, now=NOW, sleep=lambda s: None)
+    assert s2["gap_suspects"]["numbers"] == [2, 3]
+    # next run, 15 min later: 2 and 3 still not listed -> fail closed
+    r = second_world(s2, runs=[audit_run(300, 4)],
+                     **{f"repos/{REPO}/actions/runs/300/artifacts": {"artifacts": [{"id": 9, "name": "fleet-audit-state"}]},
+                        f"repos/{REPO}/actions/artifacts/9/zip": state_zip(s2)})
+    later = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 27, 12, 15, tzinfo=timezone.utc))
+    with pytest.raises(au.StateBroken, match=r"\[2, 3\] are still missing"):
+        au.load_state(later.gh, REPO, CFG, env(310, 5), au.parse_anchor(au.find_issue(later.gh, REPO, CFG)[1]), later)
+
+
+def test_a_suspected_gap_that_appears_later_was_listing_lag():
+    state, _ = first_state()
+    s2, *_ = au.run_audit(FakeGH(second_world(state)), REPO, CFG, env(300, 4), {}, now=NOW, sleep=lambda s: None)
+    r = second_world(s2, runs=[audit_run(300, 4), audit_run(250, 3, conclusion="cancelled"), audit_run(240, 2)],
+                     **{f"repos/{REPO}/actions/runs/300/artifacts": {"artifacts": [{"id": 9, "name": "fleet-audit-state"}]},
+                        f"repos/{REPO}/actions/artifacts/9/zip": state_zip(s2)})
+    r[SUCCESS_Q] = {"workflow_runs": [audit_run(300, 4)]}
+    later = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 27, 12, 15, tzinfo=timezone.utc))
+    loaded = au.load_state(later.gh, REPO, CFG, env(310, 5), au.parse_anchor(au.find_issue(later.gh, REPO, CFG)[1]), later)
+    assert loaded["run_id"] == 300 and later.gap_suspects is None and "listing lag" in later.notes[0]
+
+
+@pytest.mark.parametrize("extra", [
+    [dict(audit_run(210, 2), status="completed", conclusion="cancelled"),
+     dict(audit_run(220, 3), status="completed", conclusion="skipped")],
+    [dict(audit_run(210, 2), status="queued", conclusion=None),
+     dict(audit_run(220, 3), status="in_progress", conclusion=None)],
+    [dict(audit_run(210, 2), conclusion="failure"), dict(audit_run(220, 3, branch="ws/x", event="push"), conclusion="startup_failure")],
+])
+def test_cancelled_skipped_queued_and_running_runs_leave_no_gap(extra):
+    """challenger2 I3, realistic shapes: concurrency cancels pending runs; they are listed, so no gap."""
     state, _ = first_state()
     r = second_world(state)
-    with pytest.raises(au.StateBroken, match=r"run number\(s\) \[2, 3\]"):
-        load(r, env(300, 4))
+    r[f"repos/{REPO}/actions/workflows/audit.yml/runs"] = {"workflow_runs": [audit_run(200, 1)] + extra}
+    r[SUCCESS_Q] = {"workflow_runs": [audit_run(200, 1)]}
+    loaded, a = load(r, env(300, 4))
+    assert loaded["run_id"] == 200 and a.findings == [] and a.gap_suspects is None
+
+
+def test_a_number_missing_only_from_the_created_filter_is_listing_lag():
+    state, _ = first_state()
+    r = second_world(state)
+    created_q = "repos/{}/actions/workflows/audit.yml/runs?created=%3E%3D2026-11-27T11%3A45%3A00Z".format(REPO)
+    r[created_q] = {"workflow_runs": [audit_run(200, 1)]}               # the search view lags
+    r[f"repos/{REPO}/actions/workflows/audit.yml/runs"] = {"workflow_runs": [audit_run(200, 1), audit_run(210, 2)]}
+    r[SUCCESS_Q] = {"workflow_runs": [audit_run(200, 1)]}
+    loaded, a = load(r, env(300, 3))
+    assert a.findings == [] and a.gap_suspects is None
 
 
 def test_anchor_ahead_from_a_successful_run_is_a_rollback():
@@ -1361,3 +1412,78 @@ def test_integrity_flags_are_first_in_the_capped_entry():
 def test_flag_line_vector_matches_the_front_door():
     """PAU tests/test_fleet_audit_check.py pins the same line."""
     assert au.flag_line({"rule": "R2", "key": "R2:direct:x", "summary": "by @a"}) == "- `FLAG` R2 `R2:direct:x`: by @​a"
+
+
+# ---------------------------------------------------------------- challenger2 (round 5): I1, I2
+
+BASE_SHA = "7" * 40
+
+
+@pytest.mark.parametrize("branch_blob,base_blob,flagged", [
+    ("8" * 40, "8" * 40, False),     # stale branch: unchanged since the branch point, main changed ci.yml later
+    ("8" * 40, "5" * 40, True),      # the branch changed ci.yml
+    ("8" * 40, None, True),          # the branch added a workflow main never had at the branch point
+])
+def test_r5_compares_with_main_at_the_branch_point(branch_blob, base_blob, flagged):
+    """challenger2 I1: no FLAG flood for branches cut before a workflow change on main."""
+    path = ".github/workflows/ci.yml"
+    base_tree = {**WF_BLOBS}
+    if base_blob is None:
+        base_tree.pop(path)
+    else:
+        base_tree[path] = base_blob
+    r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": [run_rec(1), run_rec(2, event="pull_request")]},
+                 f"repos/{REPO}/git/trees/{D1}": tree({**WF_BLOBS, path: branch_blob}),
+                 f"repos/{REPO}/compare/main...{D1}": {"merge_base_commit": {"sha": BASE_SHA}},
+                 f"repos/{REPO}/git/trees/{BASE_SHA}": tree(base_tree)})
+    a = auditor(r)
+    a.foreign_runs({"id": 0, "at": "2026-11-27T11:40:00Z"})
+    assert len(a.findings) == (2 if flagged else 0)
+
+
+def test_run_scan_honours_the_api_budget_and_carries_the_rest():
+    """challenger2 I2: a push flood never fails the run; the cursor stops at the last run checked."""
+    runs = [dict(run_rec(i, sha=D1), created_at=f"2026-11-27T11:{i:02d}:00Z") for i in range(1, 6)]
+    r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": runs},
+                 f"repos/{REPO}/git/trees/{D1}": tree(WF_BLOBS)})
+    a = auditor(r)
+    a.call_limit = a.gh.count + 3            # listing + default tree + one more, then stop
+    cur = a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"})
+    assert "R5:runs-backlog" in a.conditions and a.findings == []
+    assert 0 < cur["id"] < 5 and cur["at"] < "2026-11-27T11:05:00Z"
+    b = auditor(r)                            # next run, no budget pressure: finishes the rest
+    cur2 = b.foreign_runs(cur)
+    assert cur2["id"] == 5 and "R5:runs-backlog" not in b.conditions
+
+
+def test_forged_checks_read_a_bounded_number_of_prs_and_keep_known_conditions():
+    """challenger2 I2: one check-runs read per open PR every run does not scale; rotate, new heads first."""
+    prs = [{"number": n, "head": {"sha": f"{n:040x}"}} for n in range(1, 6)]
+    r = world(**{f"repos/{REPO}/pulls": prs})
+    for p in prs:
+        r[f"repos/{REPO}/commits/{p['head']['sha']}/check-runs"] = {"check_runs": []}
+    cfg = {**CFG, "checks_prs_per_run": 2}
+    bad = {"77": {"why": "is not an Actions job (forged)", "pr": "5", "head": f"{5:040x}"}}
+    seen = {str(n): {"head": f"{n:040x}", "at": f"2026-11-27T10:0{n}:00Z"} for n in range(1, 6)}
+    seen["3"]["head"] = "old"                 # PR 3's head moved: read first
+    a = au.Auditor(FakeGH(r), REPO, cfg, now=NOW, sleep=lambda s: None)
+    ok, bad2, seen2 = a.forged_checks([], bad, seen)
+    reads = [c for c in a.gh.calls if "/check-runs" in c]
+    assert len(reads) == 2 and f"{3:040x}" in reads[0] and f"{1:040x}" in reads[1]
+    assert "R4:77" in a.conditions and "R4:checks-backlog" in a.conditions and bad2["77"]["pr"] == "5"
+    assert seen2["3"]["head"] == f"{3:040x}"
+
+
+def test_the_whole_run_stays_within_the_api_budget_under_a_flood():
+    """challenger2 I2 end to end: 300 branch runs and 200 open PRs finish as a successful run."""
+    runs = [dict(run_rec(i, sha=f"{i:040x}"), created_at="2026-11-27T11:50:00Z") for i in range(1, 301)]
+    prs = [{"number": n, "head": {"sha": f"{n + 1000:040x}"}, "updated_at": "2026-01-01T00:00:00Z"} for n in range(1, 201)]
+    r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": runs}, f"repos/{REPO}/pulls": prs})
+    for i in range(1, 301):
+        r[f"repos/{REPO}/git/trees/{i:040x}"] = tree(WF_BLOBS)
+    for p in prs:
+        r[f"repos/{REPO}/commits/{p['head']['sha']}/check-runs"] = {"check_runs": []}
+    gh = FakeGH(r)
+    state, plan, a, issue = au.run_audit(gh, REPO, CFG, env(200, 1), {}, now=NOW, sleep=lambda s: None)
+    assert gh.count <= CFG["api_budget_per_run"] + 40      # the budget plus the fixed calls after the last check
+    assert {"R5:runs-backlog", "R4:checks-backlog"} & {c["key"] for c in plan["conditions"]}

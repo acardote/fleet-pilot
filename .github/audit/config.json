@@ -46,5 +46,7 @@
   "accepted_previous_code": [],
   "public_vars": [
     "AUTO_MERGE_ENABLED"
-  ]
+  ],
+  "api_budget_per_run": 300,
+  "checks_prs_per_run": 60
 }

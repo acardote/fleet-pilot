@@ -519,6 +519,11 @@ class Auditor:
             cache[sha] = st in ("ahead", "identical")
         return cache[sha]
 
+    def over_budget(self) -> bool:
+        """The per-run API budget (shared GITHUB_TOKEN quota) or the time budget is spent."""
+        limit = getattr(self, "call_limit", None)
+        return self.out_of_time() or (limit is not None and self.gh.count >= limit)
+
     def out_of_time(self) -> bool:
         return self.deadline is not None and self.clock() >= self.deadline
 
@@ -621,7 +626,7 @@ class Auditor:
         cap = int(self.cfg["max_commits_per_run"])
         audited = base or ""
         for i, sha in enumerate(chain):
-            if i >= cap or self.out_of_time():
+            if i >= cap or self.over_budget():
                 self.notes.append(f"stopped after {i} of {len(chain)} commits (per-run budget); the next run continues "
                                   f"from {audited[:12]}")
                 return audited
@@ -943,20 +948,29 @@ class Auditor:
             self.flag("R7", f"R7:reviews-truncated:{self.seq}",
                       f"more than {pages * 100} PRs updated since {iso(since_pr)}: new reviews on the older ones were "
                       f"not read (tracked records are still re-verified in rotation)")
-        for p in prs:
+        # Oldest update first, so a budget stop leaves the cursor at the last PR read.
+        stopped = False
+        for p in sorted(prs, key=lambda x: x.get("updated_at") or ""):
+            if self.over_budget():
+                stopped = True
+                self.condition("R7", "R7:reviews-backlog", "reviews of recently updated PRs not all read (per-run API "
+                                                           "budget or time limit); the rest are read next run")
+                break
             n = p["number"]
             for c in self.gh.collect(f"repos/{r}/pulls/{n}/reviews", max_pages=pages)[0]:
                 if c.get("state") == "PENDING":
                     continue
                 observe(f"rv:{n}:{c.get('id')}", n, c.get("body") or "", (c.get("user") or {}).get("login"),
                         c.get("submitted_at"), None)
-        if prs:
-            cursor["prs"] = max(p.get("updated_at") or "" for p in prs) or cursor.get("prs")
-        elif first:
+            if p.get("updated_at"):
+                cursor["prs"] = max(p["updated_at"], cursor.get("prs") or "")
+        if not prs and first and not stopped:
             cursor["prs"] = iso(self.now)
         # rotation: re-fetch the least recently verified tracked records
         k = int(self.cfg["record_verify_per_run"])
         for key in sorted((x for x in snap if x in prev), key=lambda x: snap[x].get("v") or "")[:k]:
+            if self.over_budget():
+                break           # the rest stay least-recently-verified and come first next run
             rec = snap[key]
             if rec.get("v") == iso(self.now):
                 continue
@@ -980,31 +994,58 @@ class Auditor:
         return snap, cursor
 
     # ---- R4: forged checks (open conditions)
-    def forged_checks(self, ok_ids: list[int], bad: dict) -> tuple[list[int], dict]:
+    def forged_checks(self, ok_ids: list[int], bad: dict, seen: dict | None = None) -> tuple[list[int], dict, dict]:
+        """R4 with a bounded number of check-run reads per run: open PRs whose
+        head is new or changed come first, then the least recently checked.
+        A PR not read this run keeps its known forged-check conditions (same
+        head) and is read on a later run. Returns (ok ids, bad, seen)."""
         r = self.repo
         name = self.cfg["verdict_check_name"]
         vpath = self.cfg["verdict_workflow"]
         ok = set(ok_ids)
-        new_bad: dict[str, str] = {}
+        seen = dict(seen or {})
+        new_bad: dict[str, dict] = {}
         prs, complete = self.gh.collect(f"repos/{r}/pulls?state=open", max_pages=5)
         if not complete:
             self.condition("R4", "R4:scan-truncated", "more than 500 open PRs: forged checks on the rest unread")
         q = urllib.parse.urlencode({"check_name": name, "filter": "all"})
-        for p in prs:
-            head = (p.get("head") or {}).get("sha")
+        heads = {str(p["number"]): (p.get("head") or {}).get("sha") for p in prs}
+
+        def order(p):
+            s0 = seen.get(str(p["number"])) or {}
+            return (s0.get("head") == heads[str(p["number"])], s0.get("at") or "")
+        cap = int(self.cfg["checks_prs_per_run"])
+        read = 0
+        backlog = 0
+        for p in sorted(prs, key=order):
+            n, head = str(p["number"]), heads[str(p["number"])]
             if not head:
                 continue
+            if read >= cap or self.over_budget():
+                backlog += 1
+                for cid, b in (bad or {}).items():      # keep what is known for this head
+                    if isinstance(b, dict) and b.get("pr") == n and b.get("head") == head:
+                        new_bad[cid] = b
+                        self.condition("R4", f"R4:{cid}", f"{name} check run {cid} on PR #{n} {b.get('why')}")
+                continue
+            read += 1
             for cr in self.gh.collect(f"repos/{r}/commits/{head}/check-runs?{q}", key="check_runs", max_pages=3)[0]:
                 cid = cr.get("id")
                 if cr.get("status") != "completed" or cid in ok:
                     continue
-                why = bad.get(str(cid)) or self._check_untrusted(cr, vpath)
+                known = (bad or {}).get(str(cid))
+                why = (known.get("why") if isinstance(known, dict) else known) or self._check_untrusted(cr, vpath)
                 if why:
-                    new_bad[str(cid)] = why
-                    self.condition("R4", f"R4:{cid}", f"{name} check run {cid} on PR #{p['number']} {why}")
+                    new_bad[str(cid)] = {"why": why, "pr": n, "head": head}
+                    self.condition("R4", f"R4:{cid}", f"{name} check run {cid} on PR #{n} {why}")
                 else:
                     ok.add(cid)
-        return sorted(ok)[-2000:], new_bad
+            seen[n] = {"head": head, "at": iso(self.now)}
+        if backlog:
+            self.condition("R4", "R4:checks-backlog", f"{backlog} open PR(s) not re-read for forged checks this run "
+                                                      f"(per-run limit {cap} or API budget); read on later runs")
+        seen = {k: v for k, v in seen.items() if k in heads}
+        return sorted(ok)[-2000:], new_bad, seen
 
     def _check_untrusted(self, cr: dict, vpath: str) -> str | None:
         r = self.repo
@@ -1033,6 +1074,14 @@ class Auditor:
 
     # ---- R5: workflows run from outside the default branch
     def foreign_runs(self, cursor: dict | None) -> dict:
+        """R5 over workflow runs since the cursor, oldest first. A run is flagged
+        when the workflow file it ran (the blob at its head_sha) is neither
+        main's blob at the merge base of that commit (the branch did not touch
+        the file, so the definition is one main had) nor main's current blob. A
+        file the branch added or changed is flagged; a stale branch that merely
+        predates a later change on main is not. Bounded by the per-run API
+        budget and deadline: what is not processed stays behind the cursor for
+        the next run, with one backlog condition."""
         r = self.repo
         cursor = dict(cursor or {})
         since = cursor.get("at") or iso(self.now - timedelta(minutes=30))
@@ -1046,9 +1095,34 @@ class Auditor:
                       f"ones in that window were not checked (a run flood)")
         default_blobs: dict | None = None
         trees: dict[str, dict] = {}
+        bases: dict[str, str | None] = {}
+
+        def tree_of(sha: str) -> dict:
+            if sha not in trees:
+                try:
+                    trees[sha] = blobs_at(self.gh, r, sha) if SHA_RE.match(sha) else {}
+                except NotFound:
+                    trees[sha] = {}
+            return trees[sha]
+
+        def base_of(sha: str) -> str | None:
+            if sha not in bases:
+                try:
+                    cmp = self.gh.get(f"repos/{r}/compare/{urllib.parse.quote(self.default)}...{sha}") \
+                        if SHA_RE.match(sha) else {}
+                    bases[sha] = (cmp.get("merge_base_commit") or {}).get("sha")
+                except NotFound:
+                    bases[sha] = None
+            return bases[sha]
+
         new = sorted((x for x in runs if int(x.get("id") or 0) > last_id), key=lambda x: int(x["id"]))
+        done_id, stopped_at = last_id, None
         for run in new:
+            if self.over_budget():
+                stopped_at = run
+                break
             path = run.get("path") or ""
+            done_id = int(run["id"])
             if not path.startswith(".github/workflows/"):
                 continue        # dynamic workflows (Pages, Dependabot): GitHub-defined
             path = path.split("@", 1)[0]
@@ -1066,20 +1140,28 @@ class Auditor:
                           f"commit {sha[:12]} is not on the default branch (a tag or other ref named "
                           f"{self.default!r}): it ran a definition the default branch does not hold")
                 continue
+            ran = tree_of(sha).get(path)
             if default_blobs is None:
                 default_blobs = blobs_at(self.gh, r, self.default)
-            if sha not in trees:
-                try:
-                    trees[sha] = blobs_at(self.gh, r, sha) if SHA_RE.match(sha) else {}
-                except NotFound:
-                    trees[sha] = {}
-            ran, ref_blob = trees[sha].get(path), default_blobs.get(path)
-            if ran is None or ran != ref_blob:
-                self.flag("R5", f"R5:run:{run.get('id')}",
-                          f"workflow run {run.get('id')} ({path}, event {event!r}, ref {clean(run.get('head_branch'))!r}, "
-                          f"actor {(run.get('actor') or {}).get('login')!r}) ran a definition that is not the default "
-                          f"branch's ({'absent there' if ref_blob is None else 'differs'})")
-        if runs:
+            if ran is not None and ran == default_blobs.get(path):
+                continue
+            base = base_of(sha)
+            at_base = tree_of(base).get(path) if base else None
+            if ran is not None and ran == at_base:
+                continue        # unchanged on the branch: main's definition at the branch point
+            self.flag("R5", f"R5:run:{run.get('id')}",
+                      f"workflow run {run.get('id')} ({path}, event {event!r}, ref {clean(run.get('head_branch'))!r}, "
+                      f"actor {(run.get('actor') or {}).get('login')!r}) ran a definition the branch changed or added "
+                      f"({'absent on the default branch at the branch point' if at_base is None else 'differs from the default branch at the branch point'})")
+        if stopped_at is not None:
+            left = sum(1 for x in new if int(x["id"]) > done_id)
+            self.condition("R5", "R5:runs-backlog",
+                           f"{left} workflow run(s) since {since} not yet checked (per-run API budget or time limit); "
+                           f"carried to the next run")
+            cursor["id"] = done_id
+            start = ts(stopped_at.get("created_at")) or self.now
+            cursor["at"] = iso(start - timedelta(minutes=1))
+        elif runs:
             cursor["id"] = max([last_id] + [int(x.get("id") or 0) for x in runs])
             cursor["at"] = iso(self.now - timedelta(minutes=10))
         else:
@@ -1101,7 +1183,9 @@ class Auditor:
             if name in prev and prev[name] == tip:
                 snap[name] = tip
                 continue
-            if self.out_of_time():
+            if self.over_budget():
+                self.condition("R5", "R5:branches-backlog", "branch tips not all checked (per-run API budget or time "
+                                                             "limit); the rest are checked next run")
                 break       # not recorded: re-checked next run
             cmp = self.gh.get(f"repos/{r}/compare/{urllib.parse.quote(self.default)}...{tip}")
             files = cmp.get("files") or []
@@ -1209,6 +1293,17 @@ def trusted_audit_runs(gh: GitHub, repo: str, cfg: dict, env: RunEnv) -> list[di
     return sorted(out, key=lambda x: (x.get("run_number") or 0, x.get("id") or 0), reverse=True)
 
 
+def audit_run_numbers(gh: GitHub, repo: str, cfg: dict, since: str | None) -> tuple[set, bool]:
+    """run_numbers of every audit.yml run (any branch, status or conclusion)
+    created since `since`: the `created>=` listing, plus the plain newest-first
+    list as a second view for listing lag."""
+    wf = cfg["audit_workflow"].rsplit("/", 1)[-1]
+    q = urllib.parse.urlencode({"created": f">={since}"})
+    runs, complete = gh.collect(f"repos/{repo}/actions/workflows/{wf}/runs?{q}", key="workflow_runs", max_pages=10)
+    plain, _ = gh.collect(f"repos/{repo}/actions/workflows/{wf}/runs", key="workflow_runs", max_pages=2)
+    return {x.get("run_number") for x in runs + plain if isinstance(x.get("run_number"), int)}, complete
+
+
 def read_state_artifact(gh: GitHub, repo: str, cfg: dict, run: dict) -> dict | None:
     arts = (gh.get(f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100") or {}).get("artifacts") or []
     art = next((a for a in arts if a.get("name") == cfg["state_artifact"] and not a.get("expired")), None)
@@ -1256,17 +1351,23 @@ def load_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv, anchor: dict | Non
         raise AuditError(f"this is run #{env.run_number}, older than the newest successful audit run "
                          f"#{pred['run_number']} (a re-run of an old failed run): refused, so it can never become a "
                          f"successful run that the next run mistakes for its predecessor")
-    # run_number continuity: a deleted audit run leaves a permanent gap
+    # run_number continuity: a deleted audit run leaves a permanent gap.
+    # Cancelled, skipped, queued and in-progress runs are listed, so they never
+    # leave one. The `created>=` listing can lag, so a number missing from it
+    # is re-checked against the plain runs list; a number missing from both is
+    # a SUSPECT (FLAG) and fails closed only if it is still missing on the next
+    # run at least 5 minutes later (see the gap_suspects check below).
+    a.gap_suspects = None
     if env.run_number and pred.get("run_number"):
-        wf = cfg["audit_workflow"].rsplit("/", 1)[-1]
-        q = urllib.parse.urlencode({"created": f">={pred.get('created_at')}"})
-        allruns, complete = gh.collect(f"repos/{repo}/actions/workflows/{wf}/runs?{q}", key="workflow_runs", max_pages=10)
+        nums, complete = audit_run_numbers(gh, repo, cfg, pred.get("created_at"))
         if complete:
-            nums = {x.get("run_number") for x in allruns}
             missing = [n for n in range(int(pred["run_number"]) + 1, int(env.run_number)) if n not in nums]
             if missing:
-                raise StateBroken(f"audit run number(s) {missing[:10]} between the state's run #{pred['run_number']} "
-                                  f"and this run #{env.run_number} were deleted: newer state may have been removed")
+                a.gap_suspects = {"numbers": missing[:50], "since": pred.get("created_at"), "first_seen": iso(a.now)}
+                a.flag("R6", f"R6:runs-gap-suspect:{env.run_id}",
+                       f"audit run number(s) {missing[:10]} between the state's run #{pred['run_number']} and this run "
+                       f"#{env.run_number} are not listed: deleted runs, or listing lag; this run fails closed if they "
+                       f"are still missing on the next run")
         else:
             a.flag("R6", f"R6:runs-unverifiable:{env.run_id}",
                    f"more than 1000 audit.yml runs since run {pred['id']}: run-number continuity not verified")
@@ -1275,6 +1376,22 @@ def load_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv, anchor: dict | Non
         raise StateBroken(f"audit run {pred['id']} (#{pred.get('run_number')}) succeeded but its state artifact is gone: "
                           f"state deleted (or expired after a long outage)")
     verify_state(state, pred)
+    sus = state.get("gap_suspects")
+    if sus and sus.get("numbers"):
+        nums, complete = audit_run_numbers(gh, repo, cfg, sus.get("since"))
+        still = [n for n in sus["numbers"] if n not in nums]
+        first = ts(sus.get("first_seen")) or a.now
+        if still and complete and a.now - first >= timedelta(minutes=5):
+            raise StateBroken(f"audit run number(s) {still[:10]} are still missing {int((a.now - first).total_seconds() // 60)} "
+                              f"min after they were first noticed: audit runs were deleted (newer state may have been removed)")
+        if still:
+            carry = {"numbers": still, "since": sus.get("since"), "first_seen": sus.get("first_seen")}
+            a.gap_suspects = carry if not a.gap_suspects else {
+                "numbers": sorted(set(still) | set(a.gap_suspects["numbers"]))[:50],
+                "since": min(sus.get("since") or "", a.gap_suspects["since"] or "") or sus.get("since"),
+                "first_seen": sus.get("first_seen")}
+        else:
+            a.notes.append(f"run numbers {sus['numbers'][:10]} suspected last run are listed now (listing lag)")
     # the code the predecessor ran must be this run's code (or one it accepts)
     if env.workflow_sha:
         cur = code_digest(gh, repo, env.workflow_sha)
@@ -1459,6 +1576,7 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
         raise AuditError(f"default branch is {meta.get('default_branch')!r}, config says {cfg['default_branch']!r}")
     deadline = clock() + int(cfg["time_budget_seconds"])
     a = Auditor(gh, repo, cfg, now=now, sleep=sleep, deadline=deadline, clock=clock, hmac_key=hmac_key)
+    a.call_limit = gh.count + int(cfg["api_budget_per_run"])
     issue, body = find_issue(gh, repo, cfg)
     anchor = parse_anchor(body)
     if issue is not None and anchor is None and body and ANCHOR_BEGIN in body:
@@ -1517,7 +1635,8 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
     controls = a.controls(prev.get("controls"), vars_ctx)
     issue_cursor = a.label_events(prev.get("issue_events_cursor"))
     records, records_cursor = a.records(prev.get("records") if state else None, prev.get("records_cursor") if state else None)
-    checks_ok, checks_bad = a.forged_checks(prev.get("checks_ok") or [], prev.get("checks_bad") or {})
+    checks_ok, checks_bad, checks_seen = a.forged_checks(prev.get("checks_ok") or [], prev.get("checks_bad") or {},
+                                                         prev.get("checks_seen") or {})
     runs_cursor = a.foreign_runs(prev.get("runs_cursor"))
     branches = a.branch_workflows(prev.get("branches"))
     code = code_digest(gh, repo, env.workflow_sha) if env.workflow_sha else ""
@@ -1528,9 +1647,9 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
     new_state = {"version": STATE_VERSION, "run_id": env.run_id, "run_number": env.run_number, "seq": seq,
                  "audited_at": audited_at, "head": new_head, "events_cursor": events_cursor, "events_seen": events_seen,
                  "issue_events_cursor": issue_cursor, "controls": controls, "records": records,
-                 "records_cursor": records_cursor, "checks_ok": checks_ok, "checks_bad": checks_bad,
+                 "records_cursor": records_cursor, "checks_ok": checks_ok, "checks_bad": checks_bad, "checks_seen": checks_seen,
                  "runs_cursor": runs_cursor, "branches": branches, "issue": issue,
-                 "open": [c["key"] for c in conditions]}
+                 "open": [c["key"] for c in conditions], "gap_suspects": getattr(a, "gap_suspects", None)}
     ordered = sorted(a.findings, key=lambda f: f["rule"] != "R6")   # integrity FLAGs first (never capped away)
     entry = make_entry(seq, prev_digest, env, new_head, code, state_digest(new_state), ordered + new_conditions,
                        conditions, audited_at, rebaseline)
