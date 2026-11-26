@@ -1,0 +1,18 @@
+# Bruno Method configuration for acardote/fleet-pilot.
+# Seeded from acardote/bruno-method templates/bruno-config.toml at b0736b3
+# (acardote/personal-assistant-ultra#583). Shared mode means Bruno issues here
+# carry the `parent` / `child` labels; .github/workflows/bruno-close-gate.yml
+# only fires on issues with one of those labels.
+schema_version = 1
+mode = "shared"
+created_at = "2026-11-26"
+created_by = "acardote"
+
+[ir]
+canonical = "github"
+github_repo = "acardote/fleet-pilot"
+beads_path = ".beads"
+
+[discipline]
+require_reconciliation = true
+adversarial_review_for = ["heavy"]
