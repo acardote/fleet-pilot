@@ -374,16 +374,43 @@ class GitHub:
 # Run trust, by API metadata only
 # --------------------------------------------------------------------------
 
-def pr_target_untrusted(run: dict, default: str) -> str | None:
+def pr_target_untrusted(run: dict, default: str, pr: dict | None = None, repo: str | None = None,
+                        base_changes: list[str] | None = None) -> str | None:
+    """None when a pull_request_target run provably took its definition from the
+    default branch: its PR is based on the default branch.
+
+    The runs API lists the run's PR in `pull_requests[]` only while the PR is
+    open; once it is merged or closed the list is EMPTY, for same-repo PRs too
+    (confirmed live: merge.yml run 45892436548, which merged fleet-pilot#10).
+    Then the run is bound to the PR it served through the PR API (`pr`, the
+    caller's PR object): the PR's head repository must be this repository (no
+    fork), its base the default branch, the run's head_sha and head_branch the
+    PR's head, and the PR's base must not have changed after the run was
+    created (`base_changes`: base_ref_changed event times), since a run before
+    a base change took the old base's definition."""
     prs = run.get("pull_requests") or []
-    if not prs:
-        return "pull_request_target with no PR (fork or unknown base)"
-    if any((p.get("base") or {}).get("ref") != default for p in prs):
-        return "pull_request_target on a PR not based on the default branch"
+    if prs:
+        if any((p.get("base") or {}).get("ref") != default for p in prs):
+            return "pull_request_target on a PR not based on the default branch"
+        return None
+    if pr is None:
+        return "pull_request_target with no PR listed and no PR to bind it to"
+    head = pr.get("head") or {}
+    if ((head.get("repo") or {}).get("full_name")) != repo:
+        return f"PR #{pr.get('number')} comes from {((head.get('repo') or {}).get('full_name'))!r}, not this repository (fork)"
+    if (pr.get("base") or {}).get("ref") != default:
+        return f"PR #{pr.get('number')} is based on {(pr.get('base') or {}).get('ref')!r}, not {default}"
+    if run.get("head_sha") != head.get("sha") or run.get("head_branch") != head.get("ref"):
+        return (f"run is for {run.get('head_branch')!r}@{str(run.get('head_sha'))[:12]}, not PR #{pr.get('number')}'s head "
+                f"{head.get('ref')!r}@{str(head.get('sha'))[:12]}")
+    created = run.get("created_at") or ""
+    if any(c >= created for c in base_changes or []):
+        return f"PR #{pr.get('number')}'s base changed after this run was created (the run may have used another base's definition)"
     return None
 
 
-def merge_run_untrusted(run: dict, repo: str, default: str, merge_path: str) -> str | None:
+def merge_run_untrusted(run: dict, repo: str, default: str, merge_path: str, pr: dict | None = None,
+                        base_changes: list[str] | None = None) -> str | None:
     """None when the run's definition provably came from the default branch."""
     if run.get("path") != merge_path:
         return f"path {run.get('path')!r}"
@@ -395,7 +422,7 @@ def merge_run_untrusted(run: dict, repo: str, default: str, merge_path: str) -> 
             return f"schedule on {run.get('head_branch')!r}"
         return None
     if event == "pull_request_target":
-        return pr_target_untrusted(run, default)
+        return pr_target_untrusted(run, default, pr, repo, base_changes)
     return f"event {event!r} on {run.get('head_branch')!r} (not schedule/pull_request_target from {default})"
 
 
@@ -537,6 +564,14 @@ class Auditor:
         later = self.SECTIONS[self.SECTIONS.index(section) + 1:]
         reserved = sum(int(shares.get(x, 0)) for x in later)
         self.section_limit = max(self.gh.count + int(shares.get(section, 0)), total - reserved)
+
+    def base_changes(self, n: int) -> list[str]:
+        """Times of base_ref_changed events on PR n (cached)."""
+        cache = self.__dict__.setdefault("_base_changes", {})
+        if n not in cache:
+            events, _ = self.gh.collect(f"repos/{self.repo}/issues/{n}/events", max_pages=3)
+            cache[n] = [e.get("created_at") or "" for e in events if e.get("event") == "base_ref_changed"]
+        return cache[n]
 
     def over_budget(self) -> bool:
         """This section's API budget (shared GITHUB_TOKEN quota) or the time budget is spent."""
@@ -744,9 +779,12 @@ class Auditor:
         seen: list[str] = [] if complete else ["more than 500 merge.yml runs in the window; not all read"]
         pending = False
         max_pending = timedelta(minutes=int(self.cfg["max_pending_minutes"]))
+        changes: list[str] | None = None
         for run in sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True):
             rid = run.get("id")
-            why = merge_run_untrusted(run, self.repo, self.default, mpath)
+            if changes is None and run.get("event") == "pull_request_target" and not run.get("pull_requests"):
+                changes = self.base_changes(n)
+            why = merge_run_untrusted(run, self.repo, self.default, mpath, pr, changes)
             if why:
                 seen.append(f"run {rid} untrusted: {why}")
                 continue
@@ -1077,7 +1115,7 @@ class Auditor:
                 if cr.get("status") != "completed" or cid in ok:
                     continue
                 known = (bad or {}).get(str(cid))
-                why = (known.get("why") if isinstance(known, dict) else known) or self._check_untrusted(cr, vpath)
+                why = (known.get("why") if isinstance(known, dict) else known) or self._check_untrusted(cr, vpath, p)
                 if why:
                     new_bad[str(cid)] = {"why": why, "pr": n, "head": head}
                     self.condition("R4", f"R4:{cid}", f"{name} check run {cid} on PR #{n} {why}")
@@ -1092,7 +1130,11 @@ class Auditor:
         seen = {k: v for k, v in seen.items() if k in heads}
         return sorted(ok)[-2000:], new_bad, seen
 
-    def _check_untrusted(self, cr: dict, vpath: str) -> str | None:
+    def _check_untrusted(self, cr: dict, vpath: str, pr: dict | None = None) -> str | None:
+        """A check run is trusted only as a job of a trusted verdict.yml run. A
+        job that never got a runner (runner_name null, no steps) is accepted
+        only when it was cancelled or skipped, as verdict.yml's concurrency
+        group does (#594); an API-created check run has no job at all."""
         r = self.repo
         app = (cr.get("app") or {}).get("id")
         if app != int(self.cfg["actions_app_id"]):
@@ -1101,9 +1143,10 @@ class Auditor:
             job = self.gh.get(f"repos/{r}/actions/jobs/{cr.get('id')}")
         except NotFound:
             return "is not an Actions job (forged)"
-        if job.get("runner_name") is None or not job.get("steps"):
+        no_runner = job.get("runner_name") is None or not job.get("steps")
+        if no_runner and job.get("conclusion") not in ("cancelled", "skipped"):
             return (f"was created through the API (runner_name={job.get('runner_name')!r}, "
-                    f"steps={len(job.get('steps') or [])})")
+                    f"steps={len(job.get('steps') or [])}, conclusion {job.get('conclusion')!r})")
         try:
             run = self.gh.get(f"repos/{r}/actions/runs/{job.get('run_id')}")
         except NotFound:
@@ -1114,7 +1157,8 @@ class Auditor:
             return "is a job of a run in another repository"
         if run.get("event") != "pull_request_target":
             return f"is a job of a {vpath} run on event {run.get('event')!r} (definition not from the default branch)"
-        why = pr_target_untrusted(run, self.default)
+        changes = self.base_changes(pr["number"]) if pr and not run.get("pull_requests") else None
+        why = pr_target_untrusted(run, self.default, pr, r, changes)
         return f"is a job of an untrusted {vpath} run ({why})" if why else None
 
     # ---- R5: workflows run from outside the default branch

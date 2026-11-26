@@ -1,0 +1,123 @@
+{
+ "_source": "Real API shapes, trimmed, fetched 2026-11-26 from acardote/fleet-pilot (public): merge.yml run 45892436548 that merged PR #10, PR #10, verdict.yml run 45892436517 with its job and check run. pull_requests[] is empty on both runs because the PR is merged.",
+ "merge_run": {
+  "id": 45892436548,
+  "run_number": 22,
+  "run_attempt": 1,
+  "event": "pull_request_target",
+  "head_branch": "ws/e5-positive",
+  "head_sha": "582ef9be810f4b4865b56d4900ac9d6a7e9d37c1",
+  "path": ".github/workflows/merge.yml",
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-11-26T20:37:52Z",
+  "updated_at": "2026-11-26T20:38:13Z",
+  "pull_requests": [],
+  "repository": {
+   "full_name": "acardote/fleet-pilot"
+  },
+  "head_repository": {
+   "full_name": "acardote/fleet-pilot"
+  }
+ },
+ "verdict_run": {
+  "id": 45892436517,
+  "run_number": 50,
+  "run_attempt": 1,
+  "event": "pull_request_target",
+  "head_branch": "ws/e5-positive",
+  "head_sha": "582ef9be810f4b4865b56d4900ac9d6a7e9d37c1",
+  "path": ".github/workflows/verdict.yml",
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-11-26T20:37:52Z",
+  "updated_at": "2026-11-26T20:38:04Z",
+  "pull_requests": [],
+  "repository": {
+   "full_name": "acardote/fleet-pilot"
+  },
+  "head_repository": {
+   "full_name": "acardote/fleet-pilot"
+  }
+ },
+ "verdict_job": {
+  "id": 140158104066,
+  "run_id": 45892436517,
+  "name": "review-verdict",
+  "head_sha": "582ef9be810f4b4865b56d4900ac9d6a7e9d37c1",
+  "status": "completed",
+  "conclusion": "success",
+  "runner_name": "GitHub Actions 1000003150",
+  "steps": [
+   {
+    "name": "Set up job"
+   },
+   {
+    "name": "Provenance"
+   },
+   {
+    "name": "Refuse a definition not on the default branch"
+   },
+   {
+    "name": "Check out the default-branch commit that defined this run"
+   },
+   {
+    "name": "Confirm the checkout is the workflow commit"
+   },
+   {
+    "name": "Compute verdict"
+   },
+   {
+    "name": "Post Check out the default-branch commit that defined this run"
+   },
+   {
+    "name": "Complete job"
+   }
+  ]
+ },
+ "verdict_check_run": {
+  "id": 140158104066,
+  "name": "review-verdict",
+  "status": "completed",
+  "conclusion": "success",
+  "app": {
+   "id": 15368
+  },
+  "head_sha": "582ef9be810f4b4865b56d4900ac9d6a7e9d37c1"
+ },
+ "pr": {
+  "base": {
+   "ref": "main"
+  },
+  "head": {
+   "ref": "ws/e5-positive",
+   "repo": {
+    "full_name": "acardote/fleet-pilot"
+   },
+   "sha": "582ef9be810f4b4865b56d4900ac9d6a7e9d37c1"
+  },
+  "labels": [
+   "weight:trivial",
+   "auto-merge"
+  ],
+  "merge_commit_sha": "f156d2d979144c703d2aa66238eafdd8ecff3005",
+  "merged_at": "2026-11-26T20:38:09Z",
+  "merged_by": {
+   "login": "github-actions[bot]"
+  },
+  "number": 10,
+  "title": "docs: describe the E5 merge path (#580)"
+ },
+ "merge_log_lines": [
+  "2026-11-26T20:38:04.1183518Z VERDICT-RECOMPUTED pr=10 head=582ef9be810f4b4865b56d4900ac9d6a7e9d37c1 result=pass",
+  "2026-11-26T20:38:10.3012164Z MERGED pr=10 head=582ef9be810f4b4865b56d4900ac9d6a7e9d37c1 run_id=45892436548 workflow_ref=acardote/fleet-pilot/.github/workflows/merge.yml@refs/heads/main"
+ ],
+ "merge_commit": {
+  "sha": "f156d2d979144c703d2aa66238eafdd8ecff3005",
+  "parents": [
+   "8036a6d52859f981515a239b2be8bc3fd024e37a"
+  ],
+  "committer": "web-flow",
+  "verified": true
+ }
+}

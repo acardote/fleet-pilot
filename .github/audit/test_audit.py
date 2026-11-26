@@ -1603,3 +1603,103 @@ def test_an_r5_backlog_older_than_30_minutes_flags_the_oldest_run():
     a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"}, {"runs": 0})
     f = [x for x in a.findings if x["key"].startswith("R5:run-unchecked:")]
     assert len(f) == 1 and "actor 'acardote'" in f[0]["summary"] and "50 min" in f[0]["summary"]
+
+
+# ---------------------------------------------------------------- live bug: empty pull_requests[] (N2 residual)
+
+LIVE = json.loads((HERE / "live_shapes_pr10.json").read_text())
+
+
+def live_world(pr=None, run=None):
+    m = LIVE["merge_commit"]
+    pr = copy.deepcopy(pr or LIVE["pr"])
+    run = copy.deepcopy(run or LIVE["merge_run"])
+    lines = "\n".join(LIVE["merge_log_lines"])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("merge/5_Merge.txt", lines)
+    return world(**{
+        f"repos/{REPO}/compare/{m['parents'][0]}...{m['sha']}": cmp([commit(m["sha"], m["parents"])], base=m["parents"][0]),
+        f"repos/{REPO}/commits/{m['sha']}/pulls": [{"number": 10, "merged_at": pr["merged_at"], "merge_commit_sha": m["sha"]}],
+        f"repos/{REPO}/pulls/10": pr,
+        f"repos/{REPO}/actions/workflows/merge.yml/runs": {"workflow_runs": [run]},
+        f"repos/{REPO}/actions/runs/{run['id']}/logs": buf.getvalue(),
+        f"repos/{REPO}/issues/10/events": [{"event": "labeled"}, {"event": "labeled"}, {"event": "merged"}, {"event": "closed"}],
+    })
+
+
+def live_audit(**kw):
+    m = LIVE["merge_commit"]
+    a = au.Auditor(FakeGH(live_world(**kw)), REPO, CFG, now=datetime(2026, 11, 26, 20, 50, tzinfo=timezone.utc),
+                   sleep=lambda s: None)
+    a.audit_commits(m["parents"][0], m["sha"])
+    return a
+
+
+def test_live_bot_merge_with_empty_pull_requests_is_verified():
+    """Live false positive (audit run 45892979023, seq 3): merge.yml run 45892436548 merged PR #10; the
+    runs API lists no pull_requests for it once the PR is merged. Bound to PR #10 through the PR API."""
+    assert LIVE["merge_run"]["pull_requests"] == []
+    a = live_audit()
+    assert a.findings == [] and "verified by run 45892436548" in a.ledger[-1]
+
+
+@pytest.mark.parametrize("mutate,why", [
+    (lambda pr, run: pr["head"].update(repo={"full_name": "evil/fork"}), "fork"),
+    (lambda pr, run: pr["head"].update(repo=None), "fork"),
+    (lambda pr, run: pr["base"].update(ref="ws/other"), "not main"),
+    (lambda pr, run: run.update(head_sha="c" * 40), "not PR #10's head"),
+    (lambda pr, run: run.update(head_branch="ws/other"), "not PR #10's head"),
+])
+def test_live_shape_still_refuses_forks_other_bases_and_other_heads(mutate, why):
+    pr, run = copy.deepcopy(LIVE["pr"]), copy.deepcopy(LIVE["merge_run"])
+    mutate(pr, run)
+    a = live_audit(pr=pr, run=run)
+    assert rules_of(a) == ["R1:provenance"] and why.split()[0] in a.findings[0]["summary"]
+
+
+def test_a_base_change_after_the_run_makes_it_untrusted():
+    r = live_world()
+    r[f"repos/{REPO}/issues/10/events"] = [{"event": "base_ref_changed", "created_at": "2026-11-26T20:38:00Z"}]
+    m = LIVE["merge_commit"]
+    a = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 26, 20, 50, tzinfo=timezone.utc), sleep=lambda s: None)
+    a.audit_commits(m["parents"][0], m["sha"])
+    assert rules_of(a) == ["R1:provenance"] and "base changed after" in a.findings[0]["summary"]
+
+
+def r4_world(job=None, pr=None):
+    pr = pr or {"number": 10, "head": {"sha": LIVE["pr"]["head"]["sha"], "ref": LIVE["pr"]["head"]["ref"],
+                                       "repo": {"full_name": REPO}}, "base": {"ref": "main"}}
+    job = job or LIVE["verdict_job"]
+    cr = LIVE["verdict_check_run"]
+    return world(**{f"repos/{REPO}/pulls": [pr],
+                    f"repos/{REPO}/commits/{pr['head']['sha']}/check-runs": {"check_runs": [cr]},
+                    f"repos/{REPO}/actions/jobs/{cr['id']}": job,
+                    f"repos/{REPO}/actions/runs/{job['run_id']}": LIVE["verdict_run"],
+                    f"repos/{REPO}/issues/10/events": []})
+
+
+def test_live_verdict_check_with_empty_pull_requests_is_trusted():
+    """R4 had the same assumption: a real review-verdict job of verdict.yml run 45892436517 (empty
+    pull_requests[]) would have been flagged as forged."""
+    assert LIVE["verdict_run"]["pull_requests"] == []
+    a = auditor(r4_world())
+    ok, bad, _ = a.forged_checks([], {})
+    assert a.conditions == {} and LIVE["verdict_check_run"]["id"] in ok
+
+
+def test_live_verdict_check_on_a_fork_pr_is_still_flagged():
+    pr = {"number": 10, "head": {"sha": LIVE["pr"]["head"]["sha"], "ref": LIVE["pr"]["head"]["ref"],
+                                 "repo": {"full_name": "evil/fork"}}, "base": {"ref": "main"}}
+    a = auditor(r4_world(pr=pr))
+    a.forged_checks([], {})
+    assert list(a.conditions) == [f"R4:{LIVE['verdict_check_run']['id']}"]
+
+
+@pytest.mark.parametrize("conclusion,flagged", [("cancelled", False), ("skipped", False), ("success", True)])
+def test_a_runnerless_job_is_accepted_only_when_cancelled_or_skipped(conclusion, flagged):
+    """#594: verdict.yml's concurrency cancels jobs before they get a runner (runner_name null, no steps)."""
+    job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion=conclusion)
+    a = auditor(r4_world(job=job))
+    a.forged_checks([], {})
+    assert bool(a.conditions) is flagged
