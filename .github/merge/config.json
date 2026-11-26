@@ -81,7 +81,22 @@
     "pytest/**",
     "**/sitecustomize.py",
     "**/usercustomize.py",
-    "**/*.pth"
+    "**/*.pth",
+    "**/Makefile",
+    "**/makefile",
+    "**/GNUmakefile",
+    "**/*.mk",
+    "**/justfile",
+    "**/Justfile",
+    "**/.justfile",
+    "**/Taskfile.yml",
+    "**/Taskfile.yaml",
+    "**/Dockerfile",
+    "**/Dockerfile.*",
+    "**/docker-compose.yml",
+    "**/docker-compose.yaml",
+    "**/compose.yml",
+    "**/compose.yaml"
   ],
   "derive_roots": [
     ".claude/settings*.json",

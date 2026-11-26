@@ -188,6 +188,9 @@ class Git:
             cfg.append(("protocol.file.allow", "always"))  # local test remotes only
         if token and url.startswith("https://"):
             basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                # The runner masks the token, not its base64 form: register that too.
+                print(f"::add-mask::{basic}", flush=True)
             cfg.append(("http.extraheader", f"AUTHORIZATION: basic {basic}"))
         env["GIT_CONFIG_COUNT"] = str(len(cfg))
         for i, (k, v) in enumerate(cfg):
@@ -275,7 +278,28 @@ def parse_raw_diff(out: bytes) -> list[Change]:
 #   path-like token ending in a script extension (.sh .py .js ...);
 # - a Python import, a dynamic loader with a literal or path-joined target, a
 #   path-joined or literal script path in Python;
-# - a local action (`uses: ./x`), a symlink's target, a Markdown `@path` import.
+# - a local action (`uses: ./x`), a symlink's target, a Markdown `@path` import;
+# - the command a shell command position runs, read structurally (fleet-pilot#3
+#   verify N1/N2): through assignments (`FOO=1 x`), keywords (`if`, `!`, `then`),
+#   `$(...)`, backticks, `<(...)`, pipes, `find -exec`, `cd D && ./x` and a step's
+#   working-directory, and wrappers (timeout, xargs, env, nice, nohup, sudo, exec,
+#   command, time, stdbuf, setsid, ionice, flock, watch, eval, uv/poetry run, ...)
+#   with their options and fixed arguments skipped; an option a wrapper table
+#   does not know is read both ways (flag, or option + argument);
+# - `python -m a.b`: a/b.py, a/b/__init__.py, a/b/__main__.py, a/__init__.py,
+#   all 7a whether present or not (a PR that creates one shadows the module);
+#   `python -c CODE` and a python here-document are read as Python;
+# - `make`: the makefile it reads (and its includes) is derived and its recipes
+#   read as shell; `just`: the justfile; npm/pnpm/yarn/bun: package.json, whose
+#   scripts are read as shell (lifecycle hooks run on install). Makefiles,
+#   justfiles, Taskfiles, Dockerfiles and compose files are also on the floor;
+# - subprocess/os.system/os.exec* calls in Python with literal arguments, and any
+#   token naming an executable-bit (100755) file in the tree.
+# Residual, by design: a test runner's arguments (`pytest tests/`) are not edges,
+# so tests/** is not 7a unless named on the floor. Taskfile recipes are not
+# derived (a `task` invocation fails closed). JavaScript in a github-script
+# `script:` is scanned for edges, but its syntax is not shell, so the structural
+# pass reports nothing from it.
 # Mentions are not edges: a bare word (`tests`, `name: docs`), a data path, a
 # directory argument to a test runner, a `paths:` filter. They used to swallow
 # whole directories (docs/**, kb/**, tools/**) and made nothing auto-mergeable.
@@ -330,6 +354,7 @@ MD_IMPORT_RE = re.compile(r"""(?:^|\s)@([A-Za-z0-9_.\-/]+)""")
 DYNAMIC_CALLS = {"import_module", "__import__", "run_path", "run_module", "spec_from_file_location",
                  "SourceFileLoader", "load_source"}
 MAX_EXPANSIONS = 16
+PY_M_OPT_RE = re.compile(r"(?:^|\s)-[A-Za-z]*m\s+$")
 
 
 def _clean(tok: str) -> str:
@@ -354,6 +379,306 @@ def is_script(tok: str) -> bool:
     return tok.lower().endswith(SCRIPT_EXTS)
 
 
+# --- Shell command positions --------------------------------------------
+# A second, structural pass over shell text: split it into simple commands,
+# drop assignments, keywords and redirections, look through wrapper commands
+# (timeout, xargs, env, sudo, ...) to the command they run, and follow what
+# that command executes: a path, `python -m mod`, `make`, an npm-family run.
+# The regex passes above stay; this pass only adds edges. Rule: when a
+# wrapper option is not known, both readings (flag, or option with an
+# argument) are followed, so an unknown option can over-include, never drop.
+
+def _wrapper(arg: str = "", flags: str = "", larg: str = "", lflags: str = "", pos: int = 0,
+             attached: str = "", assigns: bool = False, cmdstr: str = "", numeric: bool = False,
+             joined: bool = False, nocmd: bool = False) -> dict:
+    return {"arg": set(arg.split()), "flags": set(flags.split()), "larg": set(larg.split()),
+            "lflags": set(lflags.split()), "pos": pos, "attached": set(attached.split()),
+            "assigns": assigns, "cmdstr": set(cmdstr.split()), "numeric": numeric, "joined": joined,
+            "nocmd": nocmd}
+
+
+WRAPPERS: dict[str, dict] = {
+    "timeout": _wrapper("-s -k", "-v", "--signal --kill-after", "--foreground --preserve-status --verbose", pos=1),
+    "xargs": _wrapper("-n -L -P -s -d -E -I -a", "-0 -r -t -p -x -o", "--max-args --max-lines --max-procs "
+                      "--max-chars --delimiter --eof --replace --arg-file --process-slot-var",
+                      "--null --no-run-if-empty --verbose --interactive --exit --open-tty", attached="-e -i -l"),
+    "env": _wrapper("-u -C -S", "-i -0 -v -", "--unset --chdir --split-string",
+                    "--ignore-environment --null --debug", assigns=True, cmdstr="-S --split-string"),
+    "nice": _wrapper("-n", "", "--adjustment", "", numeric=True),
+    "nohup": _wrapper(),
+    "sudo": _wrapper("-u -g -h -C -D -p -r -t -U -T -R", "-A -b -E -H -i -k -K -l -n -P -S -s -v -V -B -N",
+                     "--user --group --host --close-from --chdir --prompt --role --type --other-user "
+                     "--command-timeout --chroot", "--preserve-env --login --non-interactive --shell --stdin "
+                     "--askpass --background --set-home --reset-timestamp --remove-timestamp", assigns=True),
+    "doas": _wrapper("-u -C", "-n -s -L"),
+    "exec": _wrapper("-a", "-c -l"),
+    "command": _wrapper("", "-p -v -V"),
+    "builtin": _wrapper(),
+    "time": _wrapper("-f -o", "-p -a -v -q", "--format --output", "--portability --append --verbose --quiet"),
+    "stdbuf": _wrapper("-i -o -e", "", "--input --output --error"),
+    "setsid": _wrapper("", "-c -f -w", "", "--ctty --fork --wait"),
+    "ionice": _wrapper("-c -n -p -P -u", "-t", "--class --classdata --pid --pgid --uid", "--ignore"),
+    "flock": _wrapper("-w -E", "-s -x -e -u -n -o -F", "--timeout --conflict-exit-code",
+                      "--shared --exclusive --unlock --nonblock --close --no-fork --verbose", pos=1,
+                      cmdstr="-c --command"),
+    "watch": _wrapper("-n -q", "-b -c -C -d -e -g -p -r -t -w -x", "--interval --equexit",
+                      "--beep --color --no-color --differences --errexit --chgexit --precise --no-rerun "
+                      "--no-title --no-wrap --exec", joined=True),
+    "chrt": _wrapper("-T -P -D", "-a -b -d -e -f -i -m -o -p -r -R -v", pos=1),
+    "taskset": _wrapper("", "-a -p -c", "", "--all-tasks --pid --cpu-list", pos=1),
+    "unbuffer": _wrapper("", "-p"),
+    "caffeinate": _wrapper("-t -w", "-d -i -m -s -u"),
+    "strace": _wrapper("-o -e -p -s -u -E -P -a -b -I -O -S -X", "-f -F -c -C -d -D -h -i -k -n -q -r -t -T -v "
+                       "-V -w -x -y -z -Z"),
+    "valgrind": _wrapper("", "-q -v -s"),
+    "xvfb-run": _wrapper("-e -f -n -p -s -w", "-a -l", "--error-file --auth-file --server-num --xauth-protocol "
+                         "--server-args --wait", "--listen-tcp"),
+    "dbus-run-session": _wrapper(),
+    "su": _wrapper("-s -g -G -w", "-l -m -p -P -f -", "--shell --group --supp-group --whitelist-environment",
+                   "--login --preserve-environment --pty --fast", cmdstr="-c --command", nocmd=True),
+    "runuser": _wrapper("-u -s -g -G -w", "-l -m -p -P -f -", "--user --shell --group --supp-group",
+                        "--login --preserve-environment --pty --fast", cmdstr="-c --command"),
+    "eval": _wrapper(joined=True),
+    "npx": _wrapper("-p --package", "-y -q", "--package --call", "--yes --no --quiet", cmdstr="-c --call"),
+}
+# Wrappers spelled as two words: the second word is the subcommand.
+SUBCMD_WRAPPERS: dict[tuple[str, str], dict] = {
+    ("uv", "run"): _wrapper("-p", "-q -v", "--with --with-requirements --with-editable --python --project "
+                            "--directory --package --extra --group --only-group --no-group --env-file --index "
+                            "--default-index --index-url --extra-index-url --find-links --config-file "
+                            "--cache-dir --python-preference", "--quiet --verbose --frozen --locked --no-sync "
+                            "--isolated --no-project --script --all-extras --no-dev --active --no-env-file "
+                            "--no-config --offline --exact --refresh --no-cache"),
+    ("uvx", ""): _wrapper("-p", "-q -v", "--from --with --python --index --index-url", "--quiet --verbose "
+                          "--isolated --offline --refresh --no-cache"),
+    ("poetry", "run"): _wrapper("-C -P", "-q -v -n", "--directory --project", "--quiet --verbose --no-interaction"),
+    ("pipenv", "run"): _wrapper(),
+    ("pdm", "run"): _wrapper("-p", "-g -v -q", "--project", "--global --verbose --quiet"),
+    ("hatch", "run"): _wrapper(),
+    ("rye", "run"): _wrapper(),
+    ("pixi", "run"): _wrapper("-e", "", "--environment --manifest-path"),
+    ("conda", "run"): _wrapper("-n -p", "-v", "--name --prefix --cwd", "--no-capture-output --live-stream"),
+    ("mamba", "run"): _wrapper("-n -p", "-v", "--name --prefix --cwd", "--no-capture-output --live-stream"),
+    ("micromamba", "run"): _wrapper("-n -p", "-v", "--name --prefix --cwd", ""),
+    ("bundle", "exec"): _wrapper("", "", "--gemfile", "--keep-file-descriptors"),
+    ("pnpm", "exec"): _wrapper("-C", "-r -c", "--dir --filter", "--recursive --shell-mode"),
+    ("npm", "exec"): _wrapper("-c -w", "-y", "--package --call --workspace", "--yes --no"),
+    ("yarn", "exec"): _wrapper(),
+}
+SHELL_KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}"}
+NON_EXEC_HEADS = {"for", "case", "esac", "select", "function", "in", "[", "[[", "]]", "test", "export",
+                  "local", "readonly", "declare", "typeset", "unset", "echo", "printf", "return", "exit"}
+ASSIGN_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+REDIR_RE = re.compile(r"^[0-9]*(?:&>>?|>>?\|?|<<<|<<-?|<>|>&|<&|<)(.*)$")
+HEREDOC_RE = re.compile(r"""(?<!<)<<(-?)[ \t]*(["']?)([A-Za-z_][A-Za-z0-9_]*)\2""")
+SHELL_OPS = ("&&", "||", ";;", "|&", ";", "&", "|", "\n", "(", ")")
+PY_INTERP_RE = re.compile(r"^(?:python(?:[0-9]+(?:\.[0-9]+)*)?|pypy[0-9.]*)$")
+SH_INTERP = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash"}
+# Other interpreters: (options taking an argument, options whose argument is
+# inline code, options whose argument is a file or module that is loaded).
+OTHER_INTERP: dict[str, tuple[set[str], set[str], set[str]]] = {
+    "node": ({"-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions",
+              "--env-file", "--input-type", "--title"}, {"-e", "--eval", "-p", "--print"},
+             {"-r", "--require", "--import", "--loader", "--experimental-loader"}),
+    "bun": ({"-r", "--preload"}, {"-e", "--eval", "-p", "--print"}, {"-r", "--preload"}),
+    "deno": (set(), set(), set()),
+    "tsx": (set(), {"-e", "--eval"}, set()),
+    "ts-node": ({"-r", "--require"}, {"-e", "--eval", "-p", "--print"}, {"-r", "--require"}),
+    "ruby": ({"-r", "-I", "-C", "-F", "-K", "-T", "-W", "-x"}, {"-e"}, {"-r"}),
+    "perl": ({"-I", "-M", "-m", "-x", "-C", "-d", "-D", "-l", "-0"}, {"-e", "-E"}, set()),
+    "Rscript": (set(), {"-e"}, set()),
+    "lua": ({"-l"}, {"-e"}, {"-l"}),
+}
+PY_FLAGS = set("bBdEhiIOPqRsSuvVx?")
+MAKE_PROGS = {"make", "gmake", "bmake"}
+MAKEFILES = ("GNUmakefile", "makefile", "Makefile")
+MAKE_ARG = {"-f", "--file", "--makefile", "-C", "--directory", "-I", "--include-dir", "-o", "--old-file",
+            "--assume-old", "-W", "--what-if", "--new-file", "--assume-new"}
+MAKE_ATTACHED = set("jlO")
+NPM_PROGS = {"npm", "pnpm", "yarn", "bun", "corepack"}
+NPM_DIR_OPTS = {"--prefix", "-C", "--dir", "--cwd"}
+MAKE_INCLUDE_RE = re.compile(r"^[ \t]*-?s?include[ \t]+(.+)$", re.MULTILINE)
+MODULE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+SUBPROC_SHELL_CALLS = {"system", "popen", "getoutput", "getstatusoutput", "create_subprocess_shell"}
+SUBPROC_ARGV_CALLS = {"run", "call", "check_call", "check_output", "Popen", "create_subprocess_exec"}
+SUBPROC_PATH_CALLS = {"execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe",
+                      "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle", "spawnlp", "spawnlpe"}
+EXEC_MODE = "100755"
+TOPLEVEL_RE = re.compile(r"\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)")
+DYN_PATH_RE = re.compile(r"[A-Za-z0-9_.\-/${}]+")
+MAX_CMD_DEPTH = 8
+
+
+def _extract_substitutions(text: str) -> tuple[str, list[str]]:
+    """Pull $(...), <(...), >(...) and `...` out of shell text; each body is a script of its own."""
+    out: list[str] = []
+    inner: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith(("$(", "<(", ">("), i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                j += 1
+            inner.append(text[i + 2:j - 1] if not depth else text[i + 2:])
+            out.append("__SUBST__")
+            i = j
+            continue
+        if text[i] == "`":
+            j = text.find("`", i + 1)
+            if j > i:
+                inner.append(text[i + 1:j])
+                out.append("__SUBST__")
+                i = j + 1
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out), inner
+
+
+def _lex(text: str) -> list[list[str]] | None:
+    """Split shell text into simple commands (lists of words, quotes removed).
+    None if a quote is left open."""
+    segs: list[list[str]] = [[]]
+    cur: list[str] = []
+    inword = False
+    q = ""
+    i, n = 0, len(text)
+
+    def flush() -> None:
+        nonlocal cur, inword
+        if inword:
+            segs[-1].append("".join(cur))
+        cur, inword = [], False
+
+    while i < n:
+        c = text[i]
+        if q == "'":
+            if c == "'":
+                q = ""
+            else:
+                cur.append(c)
+            i += 1
+            continue
+        if q == '"':
+            if c == '"':
+                q = ""
+            elif c == "\\" and i + 1 < n:
+                cur.append(text[i + 1])
+                i += 1
+            else:
+                cur.append(c)
+            i += 1
+            continue
+        if c in "'\"":
+            q, inword = c, True
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] != "\n":
+                cur.append(text[i + 1])
+                inword = True
+            i += 2
+            continue
+        if c == "#" and not inword:
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        op = next((o for o in SHELL_OPS if text.startswith(o, i)), None)
+        if op:
+            flush()
+            if segs[-1]:
+                segs.append([])
+            i += len(op)
+            continue
+        if c in " \t\r":
+            flush()
+            i += 1
+            continue
+        cur.append(c)
+        inword = True
+        i += 1
+    flush()
+    if q:
+        return None
+    return [s for s in segs if s]
+
+
+def _lex_lenient(text: str) -> list[list[str]]:
+    segs = _lex(text)
+    if segs is not None:
+        return segs
+    out: list[list[str]] = []  # an open quote: read line by line, closing quotes at line end
+    for line in text.split("\n"):
+        r = _lex(line) or _lex(line + "'") or _lex(line + '"') or [line.split()]
+        out.extend(s for s in r if s)
+    return out
+
+
+def _dedent(text: str) -> str:
+    lines = text.split("\n")
+    ind = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
+    return "\n".join(ln[ind:] for ln in lines)
+
+
+def _strip_comments(text: str) -> str:
+    """Remove shell comments: `#` at the start of a word, outside quotes, to the end of the line."""
+    out: list[str] = []
+    q = ""
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if q:
+            if c == q:
+                q = ""
+            elif c == "\\" and q == '"' and i + 1 < n:
+                out.append(c)
+                i += 1
+                c = text[i]
+            out.append(c)
+            i += 1
+            continue
+        if c in "'\"":
+            q = c
+        elif c == "\\" and i + 1 < n:
+            out.append(c)
+            i += 1
+            c = text[i]
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;&|("):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _split_heredocs(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Remove here-document bodies; return the rest and (introducing line, body) pairs.
+    A body whose terminator is never found is left in place (read as commands)."""
+    lines = text.split("\n")
+    out: list[str] = []
+    bodies: list[tuple[str, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for hm in HEREDOC_RE.finditer(_strip_comments(line)):
+            delim = hm.group(3)
+            j = i
+            while j < len(lines) and lines[j].strip() != delim:
+                j += 1
+            if j >= len(lines):
+                break  # no terminator: keep the lines as commands
+            bodies.append((line, "\n".join(lines[i:j])))
+            i = j + 1
+    return "\n".join(out), bodies
+
+
 class Deriver:
     def __init__(self, tree: dict[str, str], read: Callable[[str], bytes], matches: Callable[[str, list[str]], bool],
                  config: dict):
@@ -373,6 +698,8 @@ class Deriver:
         self.unresolved: list[str] = []
         self.queue: list[str] = []
         self.cur = ""                     # file being scanned
+        self._cwd = ""                    # directory of the last literal `cd` in the shell text being scanned
+        self._js = False                  # scanning a github-script `script:` (JavaScript)
 
     # -- adding --------------------------------------------------------
     def add(self, path: str) -> bool:
@@ -473,7 +800,8 @@ class Deriver:
             return (d + "/" if d else "") + a[len(SELFDIR) + 1:]
         return a
 
-    def scan_shell(self, src: str, text: str) -> None:
+    def scan_shell(self, src: str, text: str, cwd: str = "") -> None:
+        original = text
         text = QUOTED_VAR.sub(r"\1", text.replace('\\"', '"'))
         text = SHELL_COMMENT_RE.sub("", SELFDIR_RE.sub(SELFDIR, text))
         if src.endswith(("action.yml", "action.yaml")):
@@ -481,7 +809,9 @@ class Deriver:
         env = self._assignments(text)
         # Interpreter and `source` arguments: must be bounded, or the run fails closed.
         args = [m.group(1) for m in SHELL_LOAD_RE.finditer(text)]
-        args += [m.group(2) for m in SHELL_EXEC_RE.finditer(text)]
+        # `python -m mod`: the module is resolved by the command pass below, not read as a file.
+        args += [m.group(2) for m in SHELL_EXEC_RE.finditer(text)
+                 if not (PY_M_OPT_RE.search(m.group(1)) and "/" not in m.group(2))]
         for raw in args:
             if POSITIONAL_RE.match(raw.strip("\"'")):
                 continue  # "$@": runs what the caller passes (followed in the caller)
@@ -509,10 +839,432 @@ class Deriver:
                 tok = KNOWN_PREFIXES.sub("", self._selfdir(_clean(tok), src))
                 if "$" not in tok and path_like(tok) and is_script(tok):
                     self.ref(tok, src)
+        # Command positions, read structurally (wrappers, -m, make, npm, cd).
+        saved, self._cwd = self._cwd, cwd
+        self._shell_commands(src, original, env)
+        self._cwd = saved
+        self._exec_bit(text, src)
+
+    # -- shell command positions ---------------------------------------
+    def _sreport(self, msg: str) -> None:
+        """A report from the structural pass. Silent inside JavaScript (actions/github-script
+        `script:`), which is scanned for edges but is not shell, so its syntax is not evidence."""
+        if not self._js:
+            self.report(msg)
+
+    def _word(self, w: str, src: str, env: dict[str, list[str]]) -> list[str]:
+        return [KNOWN_PREFIXES.sub("", self._selfdir(a, src)) for a in self._expand(w, env)]
+
+    def _exec_path(self, w: str, src: str, env: dict[str, list[str]], *, bare_ok: bool = False,
+                   what: str = "command") -> None:
+        """A word the shell executes or loads: follow it if it names a repo path."""
+        if not w or POSITIONAL_RE.match(w) or w.startswith("-"):
+            return
+        for a in self._word(w, src, env):
+            if "__SUBST__" in a or "$" in a or SELFDIR in a:
+                # A computed path: fail closed, but only for a word that reads as a path
+                # (JavaScript in a github-script `script:` is scanned too, and is not shell).
+                if "/" in w and DYN_PATH_RE.fullmatch(w):
+                    self._sreport(f"dynamic {what} {w!r}")
+                continue
+            if not PATH_CHARS.fullmatch(a):
+                continue  # a glob or case pattern, or not a path
+            if "/" not in a and not (bare_ok and (path_like(a) or a in self.tree)):
+                continue  # a bare command word is looked up on PATH
+            self.ref(a, src, execd=True)
+            if self._cwd and not a.startswith("/"):
+                j = _normjoin(self._cwd, a[2:] if a.startswith("./") else a)
+                if j:
+                    self.ref(j, src, execd=True)
+
+    def _exec_bit(self, text: str, src: str) -> None:
+        """Any token naming an executable file in the tree (mode 100755) is an edge."""
+        for raw in TOKEN_RE.findall(text):
+            tok = _clean(raw)
+            tok = tok[2:] if tok.startswith("./") else tok
+            if "/" not in tok or not PATH_CHARS.fullmatch(tok):
+                continue
+            for c in self._candidates(tok.lstrip("/"), src):
+                if self.tree.get(c) == EXEC_MODE:
+                    self.add(c)
+                    break
+
+    def _shell_commands(self, src: str, text: str, env: dict[str, list[str]], depth: int = 0) -> None:
+        if depth > MAX_CMD_DEPTH:
+            self._sreport("shell command nesting too deep to follow")
+            return
+        text = SELFDIR_RE.sub(SELFDIR, text)
+        if src.endswith(("action.yml", "action.yaml")):
+            text = ACTION_PATH_RE.sub(SELFDIR, text)
+        # Known substitutions before the generic $(...) extraction: the repo root and $(cd D && pwd).
+        text = TOPLEVEL_RE.sub("$GITHUB_WORKSPACE", text)
+        text = CD_PWD_RE.sub(lambda mm: mm.group(1), text)
+        text, bodies = _split_heredocs(text)
+        text = _strip_comments(text)
+        for line, body in bodies:
+            names = {posixpath.basename(w) for w in re.findall(r"[A-Za-z0-9_.\-/]+", line)}
+            if any(PY_INTERP_RE.match(n) for n in names):
+                self.scan_python(src, _dedent(body))
+            elif names & SH_INTERP:
+                self._shell_commands(src, body, env, depth + 1)
+        text, inner = _extract_substitutions(text)
+        for t in inner:
+            self._shell_commands(src, t, env, depth + 1)
+        for seg in _lex_lenient(text):
+            words: list[str] = []
+            skip = False
+            for w in seg:
+                if skip:
+                    skip = False
+                    continue
+                rm = REDIR_RE.match(w)
+                if rm:
+                    skip = not rm.group(1)
+                    continue
+                words.append(w)
+            i = 0
+            while i < len(words) and (words[i] in SHELL_KEYWORDS or ASSIGN_WORD_RE.match(words[i])):
+                i += 1
+            self._run_words(words[i:], src, env, depth)
+
+    def _run_words(self, words: list[str], src: str, env: dict[str, list[str]], depth: int) -> None:
+        if not words:
+            return
+        if depth > MAX_CMD_DEPTH:
+            self._sreport("shell command nesting too deep to follow")
+            return
+        w, rest = words[0], words[1:]
+        name = posixpath.basename(w)
+        if w in NON_EXEC_HEADS:
+            return
+        if name in ("cd", "pushd"):
+            args = [a for a in rest if not a.startswith("-")]
+            vals = self._word(args[0], src, env) if args else []
+            v = vals[0] if len(vals) == 1 else "$"
+            ok = "$" not in v and "__SUBST__" not in v and SELFDIR not in v and not v.startswith(("/", "~"))
+            self._cwd = (_normjoin(self._cwd, v) or "") if ok else ""
+            return
+        if name in ("source", "."):
+            if rest:
+                self._exec_path(rest[0], src, env, bare_ok=True, what="sourced file")
+            return
+        if rest and (name, rest[0]) in SUBCMD_WRAPPERS:
+            self._wrapped(rest[1:], SUBCMD_WRAPPERS[(name, rest[0])], src, env, depth + 1)
+        elif name == "uvx":
+            self._wrapped(rest, SUBCMD_WRAPPERS[("uvx", "")], src, env, depth + 1)
+        elif name in WRAPPERS:
+            self._wrapped(rest, WRAPPERS[name], src, env, depth + 1)
+        elif PY_INTERP_RE.match(name):
+            self._python(rest, src, env)
+        elif name in SH_INTERP:
+            self._sh(rest, src, env, depth)
+        elif name in OTHER_INTERP:
+            self._interp(name, rest, src, env)
+        elif name in MAKE_PROGS:
+            self._make(rest, src, env)
+        elif name in NPM_PROGS:
+            self._npm(rest, src, env)
+        elif name == "just":
+            for jf in ("justfile", "Justfile", ".justfile"):  # recipes are shell; the files are on the floor
+                self.add(posixpath.join(self._cwd, jf) if self._cwd else jf)
+        elif name in ("task", "go-task"):
+            self._sreport(f"{name} (Taskfile) recipes are not derived")
+        elif name == "find":
+            for k, a in enumerate(rest):
+                if a in ("-exec", "-execdir", "-ok", "-okdir"):
+                    end = next((j for j in range(k + 1, len(rest)) if rest[j] in (";", "+")), len(rest))
+                    self._run_words(rest[k + 1:end], src, env, depth + 1)
+        else:
+            self._exec_path(w, src, env)
+
+    def _wrapped(self, words: list[str], spec: dict, src: str, env: dict[str, list[str]], depth: int) -> None:
+        """Skip a wrapper's options and fixed arguments, then follow the command it runs.
+        An option the table does not know is read both ways (flag, or option + argument)."""
+        if depth > MAX_CMD_DEPTH:
+            self._sreport("shell command nesting too deep to follow")
+            return
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w == "--":
+                i += 1
+                break
+            if spec["assigns"] and ASSIGN_WORD_RE.match(w):
+                i += 1
+                continue
+            if w == "-" and "-" in spec["flags"]:
+                i += 1
+                continue
+            if not w.startswith("-") or w == "-":
+                break
+            if w.startswith("--"):
+                opt, eq, val = w.partition("=")
+                if opt in spec["cmdstr"]:
+                    s = val if eq else (words[i + 1] if i + 1 < len(words) else "")
+                    self._shell_commands(src, " ".join([s] + words[i + (1 if eq else 2):]), env, depth + 1)
+                    return
+                if eq or opt in spec["lflags"]:
+                    i += 1
+                elif opt in spec["larg"]:
+                    i += 2
+                else:
+                    self._wrapped(words[i + 2:], spec, src, env, depth + 1)
+                    i += 1
+                continue
+            if spec["numeric"] and w[1:].isdigit():
+                i += 1
+                continue
+            step, unknown = 1, False
+            for j in range(1, len(w)):
+                c = "-" + w[j]
+                if c in spec["cmdstr"]:
+                    s = w[j + 1:]
+                    used = 1 if s else 2
+                    if not s:
+                        s = words[i + 1] if i + 1 < len(words) else ""
+                    self._shell_commands(src, " ".join([s] + words[i + used:]), env, depth + 1)
+                    return
+                if c in spec["arg"]:
+                    step = 1 if j < len(w) - 1 else 2
+                    break
+                if c in spec["attached"]:
+                    break
+                if c not in spec["flags"]:
+                    unknown = True
+                    break
+            if unknown:
+                self._wrapped(words[i + 2:], spec, src, env, depth + 1)
+            i += step
+        if spec["nocmd"]:
+            return
+        rest = words[i + spec["pos"]:]
+        if spec["pos"] and rest and rest[0].startswith("-"):
+            self._wrapped(rest, {**spec, "pos": 0}, src, env, depth + 1)  # flock FILE -c CMD
+            return
+        if spec["joined"]:
+            self._shell_commands(src, " ".join(rest), env, depth + 1)
+        else:
+            self._run_words(rest, src, env, depth + 1)
+
+    def _python(self, words: list[str], src: str, env: dict[str, list[str]]) -> None:
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w == "-":
+                return  # stdin; a here-document body is scanned on its own
+            if w == "--":
+                i += 1
+                break
+            if not w.startswith("-"):
+                break
+            if w.startswith("--"):
+                i += 2 if w == "--check-hash-based-pycs" else 1
+                continue
+            for j in range(1, len(w)):
+                c = w[j]
+                if c in "mcWX":
+                    val = w[j + 1:]
+                    if not val:
+                        val = words[i + 1] if i + 1 < len(words) else ""
+                        i += 1
+                    if c == "m":
+                        self._py_module(val, src, env)
+                        return
+                    if c == "c":
+                        self.scan_python(src, val)
+                        return
+                    break
+                if c not in PY_FLAGS:
+                    self._sreport(f"python option {w!r} not understood")
+                    return
+            i += 1
+        if i < len(words):
+            self._exec_path(words[i], src, env, bare_ok=True, what="python script")
+
+    def _py_module(self, mod: str, src: str, env: dict[str, list[str]]) -> None:
+        """`python -m a.b` runs a/b.py, or a/b/__main__.py after a/b/__init__.py, and imports a/__init__.py.
+        Every candidate is 7a, existing or not: a PR that creates one shadows the module."""
+        for m in self._word(mod, src, env):
+            if not MODULE_RE.fullmatch(m):
+                self._sreport(f"python -m module {mod!r} not resolvable")
+                continue
+            parts = m.split(".")
+            for base in dict.fromkeys(["", self._cwd]):
+                stem = posixpath.join(base, *parts) if base else posixpath.join(*parts)
+                cands = [stem + ".py", stem + "/__init__.py", stem + "/__main__.py"]
+                for k in range(1, len(parts)):
+                    pre = posixpath.join(base, *parts[:k]) if base else posixpath.join(*parts[:k])
+                    cands.append(pre + "/__init__.py")
+                for c in cands:
+                    if not self.add(c):
+                        self.missing.add(c)
+
+    def _sh(self, words: list[str], src: str, env: dict[str, list[str]], depth: int) -> None:
+        i, cmd_mode = 0, False
+        while i < len(words):
+            w = words[i]
+            if w in ("--", "-"):
+                i += 1
+                break
+            if w[:1] not in "-+" or len(w) == 1:
+                break
+            if w.startswith("--"):
+                i += 2 if w in ("--rcfile", "--init-file") else 1
+                continue
+            step = 1
+            for c in w[1:]:
+                if c == "c":
+                    cmd_mode = True
+                elif c in "oO":
+                    step = 2
+            i += step
+        if i >= len(words):
+            return  # reads its script from stdin
+        if cmd_mode:
+            self._shell_commands(src, words[i], env, depth + 1)
+        else:
+            self._exec_path(words[i], src, env, bare_ok=True, what="shell script")
+
+    def _interp(self, name: str, words: list[str], src: str, env: dict[str, list[str]]) -> None:
+        argopts, codeopts, loadopts = OTHER_INTERP[name]
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w == "--":
+                i += 1
+                break
+            if not w.startswith("-") or w == "-":
+                break
+            opt, eq, val = w.partition("=")
+            if opt not in argopts and opt not in codeopts and w[:2] in (argopts | codeopts) and len(w) > 2:
+                opt, eq, val = w[:2], "=", w[2:]  # attached short argument
+            if opt in codeopts:
+                self._sreport(f"inline {name} code ({opt}) not followed")
+                return
+            if opt in argopts:
+                v = val if eq else (words[i + 1] if i + 1 < len(words) else "")
+                if opt in loadopts:
+                    self._exec_path(v, src, env, what=f"{name} {opt} file")
+                i += 1 if eq else 2
+                continue
+            i += 1
+        if i < len(words):
+            self._exec_path(words[i], src, env, bare_ok=True, what=f"{name} script")
+
+    def _make(self, words: list[str], src: str, env: dict[str, list[str]]) -> None:
+        """make runs recipes from the makefile it reads: derive that makefile (scanned as shell).
+        Makefiles are also on the floor, so a PR that creates or edits one is 7a."""
+        files: list[str] = []
+        base = self._cwd
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w == "--":
+                break
+            if not w.startswith("-") or w == "-":
+                i += 1
+                continue  # a target or VAR=value
+            opt, eq, val = w.partition("=")
+            if opt not in MAKE_ARG and not w.startswith("--") and w[:2] in MAKE_ARG and len(w) > 2:
+                opt, eq, val = w[:2], "=", w[2:]
+            if opt in MAKE_ARG:
+                v = val if eq else (words[i + 1] if i + 1 < len(words) else "")
+                i += 1 if eq else 2
+                if opt in ("-f", "--file", "--makefile"):
+                    files.append(v)
+                elif opt in ("-C", "--directory"):
+                    vals = self._word(v, src, env)
+                    if len(vals) != 1 or "$" in vals[0] or "__SUBST__" in vals[0] or vals[0].startswith("/"):
+                        self._sreport(f"make directory {v!r} not resolvable")
+                        return
+                    base = _normjoin(base, vals[0]) or ""
+                continue
+            i += 1
+        if files:
+            for f in files:
+                for a in self._word(f, src, env):
+                    if "$" in a or "__SUBST__" in a or not PATH_CHARS.fullmatch(a):
+                        self._sreport(f"make file {f!r} not resolvable")
+                    else:
+                        self.ref(_normjoin(base, a) or a, src, execd=True)
+            return
+        for mf in MAKEFILES:
+            self.add(posixpath.join(base, mf) if base else mf)
+
+    def scan_make(self, src: str, text: str) -> None:
+        for mm in MAKE_INCLUDE_RE.finditer(text):
+            for f in mm.group(1).split():
+                if "$" in f or not PATH_CHARS.fullmatch(f):
+                    self._sreport(f"make include {f!r} not resolvable")
+                else:
+                    self.ref(f, src, execd=True)
+        assigns: dict[str, list[str]] = {}
+        for am in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)[ \t]*[:+?!]?=[ \t]*(.*)$", text, re.MULTILINE):
+            assigns.setdefault(am.group(1), []).append(am.group(2).strip())
+        text = re.sub(r"\$[({]([A-Za-z_][A-Za-z0-9_]*)[)}]",
+                      lambda mm: assigns[mm.group(1)][0] if len(assigns.get(mm.group(1), [])) == 1 else mm.group(0),
+                      text)
+        self.scan_shell(src, re.sub(r"(?m)^\t[@+\-]+", "\t", text))
+
+    def _npm(self, words: list[str], src: str, env: dict[str, list[str]]) -> None:
+        """npm/pnpm/yarn/bun run scripts and lifecycle hooks from package.json: derive it."""
+        d = self._cwd
+        for k, w in enumerate(words):
+            opt, eq, val = w.partition("=")
+            if opt in NPM_DIR_OPTS:
+                v = val if eq else (words[k + 1] if k + 1 < len(words) else "")
+                vals = self._word(v, src, env)
+                if len(vals) != 1 or "$" in vals[0] or "__SUBST__" in vals[0] or vals[0].startswith("/"):
+                    self._sreport(f"package directory {v!r} not resolvable")
+                    return
+                d = _normjoin(d, vals[0]) or ""
+        if any(w in ("-r", "--recursive", "-w", "--workspace", "--workspaces", "--filter", "workspaces",
+                     "workspace", "foreach") for w in words):
+            targets = [p for p in self.tree if posixpath.basename(p) == "package.json"]
+        else:
+            targets = [posixpath.join(d, "package.json") if d else "package.json"]
+        for p in targets:
+            self.add(p)  # absent: a PR that creates it is 7a by the floor (**/package.json)
+
+    def _py_subprocess(self, call: ast.Call, name: str, src: str) -> None:
+        if not call.args:
+            return
+        first = call.args[0]
+        shell = name in SUBPROC_SHELL_CALLS or any(
+            k.arg == "shell" and isinstance(k.value, ast.Constant) and bool(k.value.value) for k in call.keywords)
+        words: list[str] = []
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            if shell:
+                self._shell_commands(src, first.value, {})
+                return
+            words = [first.value]
+        elif isinstance(first, (ast.List, ast.Tuple)):
+            for e in first.elts:
+                if not (isinstance(e, ast.Constant) and isinstance(e.value, str)):
+                    break
+                words.append(e.value)
+            if shell and words:
+                self._shell_commands(src, " ".join(words), {})
+                return
+        if name in SUBPROC_PATH_CALLS:
+            words = words[:1]
+        self._run_words(words, src, {}, 0)
 
     # -- other kinds ---------------------------------------------------
     def scan_yaml(self, src: str, text: str) -> None:
         lines = text.splitlines()
+        # A step's (or a `defaults:`) working-directory changes where relative commands resolve.
+        # Each run block is also read from every literal working-directory in the file.
+        cwds = [""]
+        for wm in re.finditer(r"""^\s*(?:-\s+)?working-directory\s*:\s*["']?([^"'#\n]*?)["']?\s*(?:#.*)?$""",
+                              text, re.MULTILINE):
+            d = KNOWN_PREFIXES.sub("", wm.group(1).strip().rstrip("/") + "/").rstrip("/")
+            if "$" in d or d.startswith(("/", "~")):
+                self.report(f"working-directory {wm.group(1).strip()!r} not resolvable")
+            else:
+                d = _normjoin("", d)
+                if d is not None and d not in cwds:
+                    cwds.append(d)
         i = 0
         while i < len(lines):
             m = YAML_KEY_RE.match(lines[i])
@@ -527,14 +1279,36 @@ class Deriver:
                 continue
             if key not in YAML_CMD_KEYS:
                 continue
+            self._js = key == "script" and self._in_github_script_step(lines, i - 1, indent)
             if val[:1] in ("|", ">"):
                 block = []
                 while i < len(lines) and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > indent):
                     block.append(lines[i])
                     i += 1
-                self.scan_shell(src, "\n".join(block))
+                body = "\n".join(block)
             else:
-                self.scan_shell(src, val.strip("\"'"))
+                body = val.strip("\"'")
+            for d in cwds:
+                self.scan_shell(src, body, d)
+            self._js = False
+
+    @staticmethod
+    def _in_github_script_step(lines: list[str], at: int, indent: int) -> bool:
+        """True if the `script:` key on line `at` belongs to a step that uses actions/github-script."""
+        start = at
+        while start >= 0 and not (lines[start].lstrip().startswith("- ")
+                                  and len(lines[start]) - len(lines[start].lstrip()) < indent):
+            start -= 1
+        if start < 0:
+            return False
+        item = len(lines[start]) - len(lines[start].lstrip())
+        for k in range(start, len(lines)):
+            ln = lines[k]
+            if k > start and ln.strip() and len(ln) - len(ln.lstrip()) <= item:
+                break
+            if re.match(r"""^\s*(?:-\s+)?uses:\s*["']?actions/github-script@""", ln):
+                return True
+        return False
 
     def scan_json(self, src: str, text: str) -> None:
         try:
@@ -559,6 +1333,11 @@ class Deriver:
             elif isinstance(node, str) and is_cmd(key):
                 self.scan_shell(src, node)
         walk(doc)
+        if posixpath.basename(src) == "package.json" and isinstance(doc, dict) \
+                and isinstance(doc.get("scripts"), dict):
+            for v in doc["scripts"].values():  # every script: npm runs lifecycle hooks too
+                if isinstance(v, str):
+                    self.scan_shell(src, v)
 
     def scan_markdown(self, src: str, text: str) -> None:
         for mm in MD_IMPORT_RE.finditer(text):
@@ -596,6 +1375,8 @@ class Deriver:
             elif isinstance(node, ast.Call):
                 fn = node.func
                 name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else None
+                if name in SUBPROC_SHELL_CALLS or name in SUBPROC_ARGV_CALLS or name in SUBPROC_PATH_CALLS:
+                    self._py_subprocess(node, name, src)
                 if name in DYNAMIC_CALLS:
                     dynamic.append((node, name))
                 elif name in ("join", "Path", "PurePath", "PurePosixPath"):
@@ -603,6 +1384,7 @@ class Deriver:
             elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
                 literal_hits += self._joined(src, self._div_chain(node))
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+                self._exec_bit(node.value, src)
                 for raw in TOKEN_RE.findall(node.value):
                     tok = _clean(raw)
                     if "$" not in tok and path_like(tok) and is_script(tok) and self.ref(tok, src):
@@ -669,6 +1451,7 @@ class Deriver:
 
     def scan(self, path: str) -> None:
         self.cur = path
+        self._cwd = ""
         mode = self.tree.get(path)
         if mode == SUBMODULE_MODE:
             self.report("submodule reached by derivation")
@@ -697,6 +1480,8 @@ class Deriver:
             self.scan_json(path, text)
         elif low.endswith((".md", ".markdown")):
             self.scan_markdown(path, text)
+        elif posixpath.basename(path) in MAKEFILES or low.endswith(".mk"):
+            self.scan_make(path, text)
         else:
             self.scan_shell(path, text)
 

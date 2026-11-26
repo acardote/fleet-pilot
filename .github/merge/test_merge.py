@@ -15,6 +15,7 @@ The 7a and end-to-end tests use real git repositories in tmp_path.
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import subprocess
@@ -358,6 +359,175 @@ def test_derivation_on_this_repository_resolves():
     pats, unresolved = m.derive_7a(tree, lambda p: (ROOT / p).read_bytes(), V.matches_any, CONFIG)
     assert unresolved == []
     assert ".github/verdict/verdict.py" in pats and ".github/merge/merge.py" in pats
+
+
+# --- Command positions (fp#3 verify N1/N2): wrappers, -m, make, npm --------
+
+def wf_run(body: str) -> str:
+    return "jobs:\n  a:\n    steps:\n      - run: |\n" + "".join(f"          {ln}\n" for ln in body.split("\n"))
+
+
+WRAPPED = [
+    "timeout 30 tools/run", "timeout 30s tools/run --x", "timeout -k 5 30 tools/run",
+    "timeout --signal=KILL 30 tools/run", "timeout -s KILL 1m tools/run", "timeout --foreground 5 tools/run",
+    "ls | xargs tools/run", "ls | xargs -n1 tools/run",
+    "ls | xargs -n 1 -P 4 tools/run", "ls | xargs -I{} tools/run {}", "ls | xargs -0 -r tools/run",
+    "env A=b tools/run", "env -i A=b C=d tools/run", "env -u HOME tools/run", "env -S 'tools/run --x'",
+    "nice tools/run", "nice -n 10 tools/run", "nice -10 tools/run", "nohup tools/run &", "nohup tools/run > log 2>&1 &",
+    "sudo tools/run", "sudo -u bob -E tools/run", "sudo -E A=1 tools/run", "exec tools/run", "exec -a name tools/run",
+    "command tools/run", "time tools/run", "time -p tools/run", "stdbuf -oL tools/run", "stdbuf -o L tools/run",
+    "setsid -f tools/run", "ionice -c 3 tools/run", "flock -w 5 /tmp/lock tools/run", "flock /tmp/lock -c 'tools/run'",
+    "watch -n 5 tools/run", "eval 'tools/run --x'", "FOO=1 tools/run", "FOO=1 BAR=2 tools/run", "! tools/run",
+    "if tools/run; then echo ok; fi", "while tools/run; do :; done", "x=$(tools/run)", "x=`tools/run`",
+    'echo "$(tools/run)"', "diff <(tools/run) b", "find . -name '*.md' -exec tools/run {} \\;",
+    "find . -execdir tools/run {} +", "cd tools && ./run", "cd tools\n./run", "{ tools/run; }",
+    "f() { tools/run; }", "[ -x tools/run ] && tools/run", "true || tools/run", "tools/run | tee out",
+    "timeout 5 env A=1 nice tools/run", "sudo -u x timeout 5 tools/run", "uv run --with pyyaml tools/run",
+    "uv run --quiet --with a --with b tools/run", "poetry run tools/run", "bash -c 'tools/run'",
+    "timeout 9 bash -c 'tools/run'", "sh -ec 'cd tools && ./run'", "nohup sh -c \"tools/run\" &",
+    "timeout --frobnicate 5 tools/run", "xargs --frob tools/run", "xargs -Z 7 tools/run",
+    "tools/run \\\n  --flag", "# a comment\ntools/run", "pushd tools && ./run", "bash <<'EOF'\ntools/run\nEOF",
+]
+
+
+@pytest.mark.parametrize("body", WRAPPED)
+def test_wrapped_and_nested_commands_are_followed(body):
+    """N1: an extensionless script reached through a wrapper or a shell construct is 7a."""
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run(body), "tools/run": "echo hi\n",
+                               "docs/a.md": "x\n"})
+    assert unresolved == [], unresolved
+    assert "tools/run" in pats, (body, [p for p in pats if p not in CONFIG["floor_7a"]])
+    assert not V.matches_any("docs/a.md", pats)
+
+
+@pytest.mark.parametrize("body", [
+    "echo tools/run", "cat tools/run", "git add tools/", "ls docs/ memory/", "# run `tools/run` by hand",
+    "echo 'see `tools/run`'  # backticks in a comment: `memory/`",
+])
+def test_mentions_are_still_not_execution_edges(body):
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run(body), "tools/run": "echo\n",
+                               "memory/a.md": "x\n", "docs/a.md": "x\n"})
+    assert unresolved == []
+    for p in ("memory/a.md", "docs/a.md"):
+        assert not V.matches_any(p, pats), (body, p)
+    if "echo 'see" not in body:  # `...` inside single quotes is read as a command: over-inclusion is allowed
+        assert not V.matches_any("tools/run", pats), body
+
+
+def test_executable_bit_file_named_anywhere_is_an_edge():
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run('out="$(echo tools/run-me)"\nlog tools/plain'),
+                               "tools/run-me": "echo\n", "tools/plain": "echo\n"},
+                              modes={"tools/run-me": "100755"})
+    assert unresolved == [] and "tools/run-me" in pats
+
+
+@pytest.mark.parametrize("body", [
+    "python -m tools.gen", "python3 -m tools.gen --x", "python3 -I -m tools.gen", "python3 -Im tools.gen",
+    "python -mtools.gen", "python3 -W ignore -m tools.gen", "python3 -X dev -u -m tools.gen",
+    "python3.12 -m tools.gen", "timeout 60 python3 -I -m tools.gen", "uv run python -m tools.gen",
+    "python3 -c 'import tools.gen'", "python3 -c 'from tools import gen'",
+    "python3 - <<'EOF'\nimport tools.gen\nEOF", "cat <<EOF | python3\nfrom tools.gen import main\nEOF",
+])
+def test_python_module_invocation_resolves_to_the_module_file(body):
+    """N2: `python -m a.b` runs a/b.py (or a/b/__main__.py); the old derivation recorded a bogus 'a.b'."""
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run(body), "tools/__init__.py": "",
+                               "tools/gen.py": "from tools import helper\n", "tools/helper.py": "X = 1\n"})
+    assert unresolved == [], unresolved
+    for p in ("tools/gen.py", "tools/helper.py", "tools/__init__.py"):
+        assert p in pats, (body, p)
+    assert "tools.gen" not in pats
+
+
+def test_python_module_package_main_and_shadowing_candidates_are_7a():
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python -m tools.gen\npython -m tools.later"),
+                               "tools/gen/__init__.py": "", "tools/gen/__main__.py": "import os\n",
+                               "tests/t.py": "x\n"})
+    assert unresolved == []
+    for p in ("tools/gen/__init__.py", "tools/gen/__main__.py",
+              # not in the tree yet: a PR that creates one is 7a
+              "tools/gen.py", "tools/later.py", "tools/later/__main__.py", "tools/later/__init__.py",
+              "tools/__init__.py"):
+        assert V.matches_any(p, pats), p
+
+
+def test_python_m_pytest_does_not_make_the_test_tree_7a():
+    """By design: test files are what pytest is given, not an execution edge (the CI token is read-only)."""
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 -m pytest -q tests"),
+                               "tests/test_a.py": "def test_a():\n    pass\n"})
+    assert unresolved == []
+    assert not V.matches_any("tests/test_a.py", pats)
+    assert V.matches_any("pytest/__main__.py", pats) and V.matches_any("pytest.py", pats)
+
+
+@pytest.mark.parametrize("body,frag", [
+    ('python3 -m "$MOD"', "python -m module"),
+    ("python3 -Z tools/x.py", "python option"),
+    ('make -C "$DIR" all', "make directory"),
+    ('make -f "$MK"', "make file"),
+    ('"$TOOLS/run" --x', "dynamic command"),
+    ("timeout 5 \"${BIN}/run\"", "dynamic command"),
+    ("node -e 'require(\"./tools/x\")'", "inline node code"),
+    ('npm --prefix "$P" ci', "package directory"),
+])
+def test_unresolvable_command_positions_fail_closed(body, frag):
+    _, unresolved = derive({".github/workflows/ci.yml": wf_run(body)})
+    assert any(frag in u for u in unresolved), unresolved
+
+
+def test_github_script_javascript_is_not_read_as_shell_syntax():
+    wf = ("jobs:\n  a:\n    steps:\n      - uses: actions/github-script@v7\n        with:\n"
+          "          script: |\n            const u = `${owner}/${repo}`;\n            run(`${ref.o}/${ref.r}`);\n"
+          "      - run: '\"${BIN}/run\"'\n")
+    _, unresolved = derive({".github/workflows/ci.yml": wf})
+    assert len(unresolved) == 1 and "${BIN}/run" in unresolved[0], unresolved
+
+
+def test_make_invocation_derives_the_makefile_and_its_recipes():
+    pats, unresolved = derive({
+        ".github/workflows/ci.yml": wf_run("make test\nmake -C sub build\nmake -f build/extra.mk x"),
+        "Makefile": "PY := python3\ninclude common.mk\ntest:\n\t@scripts/check --all\n\t$(PY) -m tools.gen\n",
+        "common.mk": "lint:\n\ttools/lint-me\n",
+        "sub/Makefile": "build:\n\t./build.sh\n", "sub/build.sh": "echo\n",
+        "build/extra.mk": "x:\n\ttimeout 5 tools/x\n",
+        "scripts/check": "echo\n", "tools/gen.py": "x = 1\n", "tools/lint-me": "echo\n", "tools/x": "echo\n"})
+    assert unresolved == [], unresolved
+    for p in ("Makefile", "common.mk", "scripts/check", "tools/gen.py", "tools/lint-me", "sub/Makefile",
+              "sub/build.sh", "build/extra.mk", "tools/x"):
+        assert V.matches_any(p, pats), p
+
+
+@pytest.mark.parametrize("path", ["Makefile", "sub/makefile", "GNUmakefile", "x/rules.mk", "justfile",
+                                  "Taskfile.yml", "Dockerfile", "docker/Dockerfile.ci", "docker-compose.yml"])
+def test_build_tool_entry_files_are_on_the_floor(path):
+    assert V.matches_any(path, CONFIG["floor_7a"]), path
+
+
+@pytest.mark.parametrize("body", ["npm run build", "npm ci", "npm test", "yarn build", "pnpm install",
+                                  "timeout 600 npm run build", "cd web && npm run build", "npm --prefix web ci",
+                                  "pnpm -C web run build", "pnpm -r run build"])
+def test_npm_family_invocation_derives_package_json_scripts(body):
+    pkg = json.dumps({"scripts": {"build": "node tools/b.js", "postinstall": "tools/setup", "test": "tools/t"}})
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run(body), "package.json": pkg,
+                               "web/package.json": pkg, "tools/b.js": "1\n", "tools/setup": "echo\n",
+                               "tools/t": "echo\n"})
+    assert unresolved == [], unresolved
+    for p in ("tools/b.js", "tools/setup", "tools/t"):
+        assert V.matches_any(p, pats), (body, p)
+
+
+@pytest.mark.parametrize("code", [
+    "import subprocess\nsubprocess.run(['tools/run', '--x'])\n",
+    "import subprocess\nsubprocess.check_call(['timeout', '5', 'tools/run'])\n",
+    "import subprocess\nsubprocess.run('tools/run --x', shell=True)\n",
+    "import os\nos.system('nohup tools/run &')\n",
+    "import os\nos.execv('tools/run', ['run'])\n",
+    "import subprocess\nsubprocess.Popen(['python3', '-m', 'tools.runmod'])\n",
+])
+def test_python_subprocess_literals_are_followed(code):
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/x.py"), "tools/x.py": code,
+                               "tools/run": "echo\n", "tools/runmod.py": "x = 1\n"})
+    assert unresolved == [], unresolved
+    assert "tools/run" in pats or "tools/runmod.py" in pats, code
 
 
 # --------------------------------------------------------------------------
@@ -834,3 +1004,29 @@ def test_missing_run_id_refuses_before_any_merge(origin, capsys):
     r, merges = make_runner(origin, [pr_obj(1, origin.heads[1])])
     r.ctx.run_id = ""
     assert r.run("true") == 1 and merges == []
+
+
+def test_step_working_directory_resolves_relative_commands():
+    wf = ("jobs:\n  a:\n    steps:\n      - working-directory: tools\n        run: |\n          ./run\n"
+          "          python3 -m gen\n")
+    pats, unresolved = derive({".github/workflows/ci.yml": wf, "tools/run": "echo\n", "tools/gen.py": "x = 1\n"})
+    assert unresolved == [] and "tools/run" in pats and "tools/gen.py" in pats
+    _, unresolved = derive({".github/workflows/ci.yml": wf.replace("tools", "${{ matrix.dir }}")})
+    assert any("working-directory" in u for u in unresolved), unresolved
+
+
+def test_just_derives_the_justfile_and_task_fails_closed():
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("just check"),
+                               "justfile": "check:\n    tools/run --all\n", "tools/run": "echo\n"})
+    assert unresolved == [] and "justfile" in pats and "tools/run" in pats
+    _, unresolved = derive({".github/workflows/ci.yml": wf_run("task check")})
+    assert any("Taskfile" in u for u in unresolved), unresolved
+
+
+def test_basic_auth_header_is_masked_on_actions(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    calls = []
+    m.Git("https://github.com/o/r.git", token="tok", workdir=str(tmp_path / "g"),
+          run=lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0, b"", b""))
+    basic = base64.b64encode(b"x-access-token:tok").decode()
+    assert f"::add-mask::{basic}" in capsys.readouterr().out.splitlines()
