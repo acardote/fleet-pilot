@@ -1,24 +1,41 @@
 # merge-audit (acardote/personal-assistant-ultra#581; design: docs/design/merge-model.md section 4).
 #
-# Detection, not prevention. Flags every default-branch merge not made by a
-# default-branch merge.yml run that logged its inline verdict recomputation for
-# the merged head (R1), every other push to the default branch (R2), control
-# changes (R3), forged review-verdict checks (R4), workflow files on branches
-# (R5) and review records edited or deleted (R7). Findings go to the
-# "fleet-audit: merge audit findings" issue and the job summary.
+# Detection, not prevention. Flags every first-parent default-branch commit not
+# created by GitHub as a PR merge (R2: direct and laundered pushes), every bot
+# merge without a successful default-branch merge.yml run that logged its
+# inline verdict recomputation for the merged head (R1), control changes (R3),
+# forged review-verdict checks (R4), workflow runs whose definition is not the
+# default branch's and workflow files on branches (R5), and review records
+# edited or deleted (R7). Findings go to the "fleet-audit: merge audit findings"
+# issue (comments) and the job summary; every FLAG is also written into the
+# hash chain in that issue's body, which the front door reads, verifies and
+# turns into inbox items, so deleting a comment does not erase a FLAG.
+#
+# The admin login is shared by the operator and the agents (A11): it can delete
+# comments, artifacts, runs and issues here. That cannot be prevented, so it is
+# made detectable and fails closed: state is a hash chain bound to the run that
+# produced it and to the audit code it ran; a deleted predecessor artifact, a
+# run_number gap (deleted runs), an anchor ahead of the state (rollback) or
+# state from other audit code stops the audit (exit 2) until the operator
+# dispatches this workflow with `rebaseline`, which is itself a FLAG and a
+# chain discontinuity the front door alerts on.
 #
 # Hard rules (tests in .github/audit/test_audit.py check each one):
 # - Runs the default branch's definition only: triggers are push to main,
 #   schedule and workflow_dispatch, and the guard step refuses any other
 #   workflow ref. Never pull_request, pull_request_target or workflow_run.
 # - Runs only default-branch code: the checkout is github.workflow_sha.
-# - Token: read-only except issues: write (to post findings). No contents,
-#   pull-requests, actions or checks write.
-# - The previous run's state is a run-bound artifact; the script reads only
-#   artifacts uploaded by a trusted (default-branch) audit run.
+# - Token: read-only except issues: write (findings comments and the chain in
+#   the findings issue body). No contents, pull-requests, actions or checks write.
+# - Dispatch inputs reach the script only through env, never through ${{ }} in
+#   a run line.
 # - The front door checks from outside the repo that this workflow ran
-#   successfully in the last 30 minutes and that its blob and the script's are
-#   the pinned ones (design R6).
+#   successfully in the last 60 minutes, that every run since its last
+#   heartbeat ran the pinned blobs, that no audit run was deleted, and that the
+#   chain continues (design R6).
+#
+# Never delete runs or artifacts of this workflow: the audit reads that as
+# tampering and stops.
 #
 # Changing this file is a 7a change: the operator merges.
 name: merge-audit
@@ -29,6 +46,16 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      rebaseline:
+        description: "Only after investigating a fail-closed run: continue (keep the newest readable state) or fresh (no state)"
+        type: choice
+        options: ["no", "continue", "fresh"]
+        default: "no"
+      reason:
+        description: "Why (recorded in the chain and in the FLAG)"
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -49,7 +76,7 @@ jobs:
       issues: write
     steps:
       - name: Provenance
-        run: echo "workflow_ref=${GITHUB_WORKFLOW_REF} workflow_sha=${GITHUB_WORKFLOW_SHA} run_id=${GITHUB_RUN_ID} event=${GITHUB_EVENT_NAME}"
+        run: echo "workflow_ref=${GITHUB_WORKFLOW_REF} workflow_sha=${GITHUB_WORKFLOW_SHA} run_id=${GITHUB_RUN_ID} run_number=${GITHUB_RUN_NUMBER} event=${GITHUB_EVENT_NAME}"
 
       - name: Refuse a definition not on the default branch
         run: |
@@ -82,6 +109,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VARS_JSON: ${{ toJSON(vars) }}
+          AUDIT_HMAC_KEY: ${{ secrets.FLEET_AUDIT_HMAC_KEY }}
+          REBASELINE: ${{ inputs.rebaseline }}
+          REBASELINE_REASON: ${{ inputs.reason }}
           STATE_DIR: ${{ runner.temp }}/fleet-audit
         run: python3 .github/audit/audit.py --repo "${GITHUB_REPOSITORY}" --config .github/audit/config.json --state-out "${STATE_DIR}/state.json"
 

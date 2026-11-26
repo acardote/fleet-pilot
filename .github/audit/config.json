@@ -1,5 +1,5 @@
 {
-  "_comment": "Read by audit.py from the default branch only. Changing this file is a 7a change (operator merges), and the front door pins its blob (design R6). Design: acardote/personal-assistant-ultra docs/design/merge-model.md section 4; child issue acardote/personal-assistant-ultra#581. trusted_record_authors must equal .github/verdict/config.json's (a test checks it). baseline_sha: commits up to and including it predate the audit (pre-pilot, operator-made) and are not audited.",
+  "_comment": "Read by audit.py from the default branch only. Changing this file is a 7a change (operator merges), and the front door pins its blob (design R6). Design: acardote/personal-assistant-ultra docs/design/merge-model.md section 4; child issue acardote/personal-assistant-ultra#581. trusted_record_authors must equal .github/verdict/config.json's (a test checks it). baseline_sha: commits up to and including it predate the audit (pre-pilot, operator-made) and are not audited. accepted_previous_code: after a 7a change to audit.yml, audit.py or this file, list the PREVIOUS code digest here (PAU `fleet_audit_check.py pins` prints it as audit_code_digest) so the first run of the new code accepts the old code's state; otherwise that run fails closed until a rebaseline=continue dispatch.",
   "default_branch": "main",
   "bot_merger": "github-actions[bot]",
   "operator_logins": [
@@ -25,10 +25,26 @@
   "verdict_check_name": "review-verdict",
   "actions_app_id": 15368,
   "baseline_sha": "3224f1097ff20a788924a136326c847f83fc63e5",
-  "initial_commit_limit": 200,
-  "max_commits_per_run": 1000,
+  "max_commits_per_run": 300,
   "record_scope_days": 30,
   "state_artifact": "fleet-audit-state",
   "findings_issue_title": "fleet-audit: merge audit findings",
-  "max_log_bytes": 52428800
+  "max_log_bytes": 52428800,
+  "github_committer": "web-flow",
+  "operator_7a_pattern": "(?i)(?<![0-9A-Za-z])7a(?![0-9A-Za-z])",
+  "verdict_workflow": ".github/workflows/verdict.yml",
+  "max_range_commits": 3000,
+  "time_budget_seconds": 600,
+  "max_pending_minutes": 120,
+  "max_gap_minutes": 50,
+  "max_issue_event_pages": 10,
+  "max_record_pages": 10,
+  "record_verify_per_run": 30,
+  "max_run_pages": 10,
+  "max_branch_pages": 10,
+  "chain_keep": 100,
+  "accepted_previous_code": [],
+  "public_vars": [
+    "AUTO_MERGE_ENABLED"
+  ]
 }

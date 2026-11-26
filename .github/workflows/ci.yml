@@ -29,7 +29,9 @@ jobs:
         run: |
           python -m pip install --quiet "pytest>=8.0"
           if git ls-files '*test_*.py' '*_test.py' | grep -q .; then
-            python -m pytest -q -p no:cacheprovider
+            # pytest skips dot-directories by default, which hid .github/verdict
+            # and .github/audit (#581 review, wario I13): recurse into them.
+            python -m pytest -q -p no:cacheprovider -o norecursedirs=".git node_modules"
           else
             echo "no tests in this repo yet"
           fi
