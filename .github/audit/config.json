@@ -48,5 +48,14 @@
     "AUTO_MERGE_ENABLED"
   ],
   "api_budget_per_run": 300,
-  "checks_prs_per_run": 60
+  "checks_prs_per_run": 60,
+  "api_section_shares": {
+    "commits": 60,
+    "records": 50,
+    "checks": 60,
+    "runs": 80,
+    "branches": 20
+  },
+  "backlog_flag_after": 3,
+  "retired_workflow_blobs": []
 }

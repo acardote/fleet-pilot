@@ -1469,9 +1469,9 @@ def test_forged_checks_read_a_bounded_number_of_prs_and_keep_known_conditions():
     a = au.Auditor(FakeGH(r), REPO, cfg, now=NOW, sleep=lambda s: None)
     ok, bad2, seen2 = a.forged_checks([], bad, seen)
     reads = [c for c in a.gh.calls if "/check-runs" in c]
-    assert len(reads) == 2 and f"{3:040x}" in reads[0] and f"{1:040x}" in reads[1]
+    assert len(reads) == 2 and f"{1:040x}" in reads[0] and f"{2:040x}" in reads[1]   # least recently read first
     assert "R4:77" in a.conditions and "R4:checks-backlog" in a.conditions and bad2["77"]["pr"] == "5"
-    assert seen2["3"]["head"] == f"{3:040x}"
+    assert seen2["1"]["at"] == "2026-11-27T12:00:00Z"
 
 
 def test_the_whole_run_stays_within_the_api_budget_under_a_flood():
@@ -1487,3 +1487,94 @@ def test_the_whole_run_stays_within_the_api_budget_under_a_flood():
     state, plan, a, issue = au.run_audit(gh, REPO, CFG, env(200, 1), {}, now=NOW, sleep=lambda s: None)
     assert gh.count <= CFG["api_budget_per_run"] + 40      # the budget plus the fixed calls after the last check
     assert {"R5:runs-backlog", "R4:checks-backlog"} & {c["key"] for c in plan["conditions"]}
+
+
+# ---------------------------------------------------------------- verify5 (round 6): V5-I1, V5-M1, V5-M2
+
+def test_a_review_flood_cannot_starve_r5():
+    """V5-I1: records may not spend the shares reserved for checks and runs."""
+    prs = [{"number": n, "updated_at": f"2026-11-27T11:{n % 60:02d}:00Z", "head": {"sha": f"{n:040x}"}} for n in range(1, 400)]
+    runs = [dict(run_rec(9000 + i, sha=D1), created_at="2026-11-27T11:50:00Z") for i in range(5)]
+    r = world(**{f"repos/{REPO}/pulls": prs, f"repos/{REPO}/actions/runs": {"workflow_runs": runs},
+                 f"repos/{REPO}/git/trees/{D1}": tree({**WF_BLOBS, ".github/workflows/ci.yml": "8" * 40}),
+                 f"repos/{REPO}/compare/main...{D1}": {"merge_base_commit": {"sha": BASE_SHA}},
+                 f"repos/{REPO}/git/trees/{BASE_SHA}": tree(WF_BLOBS)})
+    for p in prs:
+        r[f"repos/{REPO}/pulls/{p['number']}/reviews"] = []
+        r[f"repos/{REPO}/commits/{p['head']['sha']}/check-runs"] = {"check_runs": []}
+    gh = FakeGH(r)
+    state, plan, a, issue = au.run_audit(gh, REPO, CFG, env(200, 1), {}, now=NOW, sleep=lambda s: None)
+    assert [f["key"] for f in plan["events"] if f["key"].startswith("R5:run:")] == [f"R5:run:{9000 + i}" for i in range(5)]
+    assert "R7:records-backlog" in {c["key"] for c in plan["conditions"]}
+
+
+def test_a_backlog_that_persists_becomes_a_flag_naming_the_oldest_run():
+    runs = [dict(run_rec(i, sha=D1), created_at=f"2026-11-27T11:{i:02d}:00Z") for i in range(1, 6)]
+    r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": runs}, f"repos/{REPO}/git/trees/{D1}": tree(WF_BLOBS)})
+    bl = {"runs": 0}
+    keys = []
+    for k in range(CFG["backlog_flag_after"]):
+        a = auditor(r, seq=k + 1)
+        a.call_limit = a.gh.count + 3
+        a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"}, bl)
+        bl = a.backlogs["runs"]
+        keys += [f["key"] for f in a.findings]
+    assert keys == [f"R5:runs-backlog:{CFG['backlog_flag_after']}"]
+    assert "Oldest waiting: run 2" in a.findings[0]["summary"] and "actor 'acardote'" in a.findings[0]["summary"]
+
+
+def test_a_section_starved_to_zero_is_a_flag_at_once():
+    runs = [dict(run_rec(1, sha=D1), created_at="2026-11-27T11:01:00Z")]
+    a = auditor(world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": runs}}))
+    a.call_limit = a.gh.count            # nothing left
+    a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"})
+    assert [f["key"] for f in a.findings] == ["R5:runs-backlog:0"] and "starved" in a.findings[0]["summary"]
+
+
+def test_a_run_deleted_while_waiting_in_the_backlog_is_flagged():
+    pending = [{"id": 7, "path": ".github/workflows/ci.yml", "branch": "ws/x", "actor": "acardote"}]
+    a = auditor(world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": []}}))
+    a.foreign_runs({"id": 6, "at": "2026-11-27T11:00:00Z", "pending": pending})
+    assert [f["key"] for f in a.findings] == ["R5:run-vanished:7"] and "'acardote'" in a.findings[0]["summary"]
+
+
+@pytest.mark.parametrize("main_has_file,retired,flagged", [
+    (True, False, False),     # stale branch, file still on main: accepted
+    (False, False, True),     # main deleted the workflow since: its old version is not accepted
+    (True, True, True),       # the old version is retired (config, 7a): not accepted
+])
+def test_an_old_main_version_is_accepted_only_while_main_keeps_the_file_and_it_is_not_retired(main_has_file, retired, flagged):
+    """V5-M1."""
+    path = ".github/workflows/ci.yml"
+    old = "8" * 40
+    main_tree = dict(WF_BLOBS) if main_has_file else {k: v for k, v in WF_BLOBS.items() if k != path}
+    r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": [run_rec(1)]},
+                 f"repos/{REPO}/git/trees/main": tree(main_tree),
+                 f"repos/{REPO}/git/trees/{D1}": tree({**WF_BLOBS, path: old}),
+                 f"repos/{REPO}/compare/main...{D1}": {"merge_base_commit": {"sha": BASE_SHA}},
+                 f"repos/{REPO}/git/trees/{BASE_SHA}": tree({**WF_BLOBS, path: old})})
+    cfg = {**CFG, "retired_workflow_blobs": [old] if retired else []}
+    a = au.Auditor(FakeGH(r), REPO, cfg, now=NOW, sleep=lambda s: None)
+    a.foreign_runs({"id": 0, "at": "2026-11-27T11:40:00Z"})
+    assert bool(a.findings) is flagged
+
+
+def test_a_gap_recheck_that_cannot_complete_fails_closed():
+    """V5-M2: flooding >1000 runs to make the re-check incomplete no longer disables the fail-closed."""
+    state, _ = first_state()
+    s2, *_ = au.run_audit(FakeGH(second_world(state)), REPO, CFG, env(300, 4), {}, now=NOW, sleep=lambda s: None)
+    r = second_world(s2, runs=[audit_run(300, 4)] + [audit_run(400 + i, 10 + i) for i in range(3)],
+                     **{f"repos/{REPO}/actions/runs/300/artifacts": {"artifacts": [{"id": 9, "name": "fleet-audit-state"}]},
+                        f"repos/{REPO}/actions/artifacts/9/zip": state_zip(s2)})
+    r[SUCCESS_Q] = {"workflow_runs": [audit_run(300, 4)]}
+    r[f"repos/{REPO}/actions/workflows/audit.yml/runs?created=%3E%3D2026-11-27T11%3A45%3A00Z"] = \
+        {"workflow_runs": Incomplete([audit_run(300, 4), audit_run(250, 3), audit_run(240, 2)])}
+    later = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 27, 12, 15, tzinfo=timezone.utc))
+    with pytest.raises(au.StateBroken, match="still missing"):
+        au.load_state(later.gh, REPO, CFG, env(310, 5), au.parse_anchor(au.find_issue(later.gh, REPO, CFG)[1]), later)
+
+
+def test_the_gap_suspect_kind_travels_in_the_witness():
+    e = {"seq": 3, "digest": "c" * 64, "run_id": 5, "flags_total": 1,
+         "flags": [{"rule": "R6", "key": "R6:runs-gap-suspect:5"}]}
+    assert au.witness_line(e).endswith("r6=runs-gap-suspect")

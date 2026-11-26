@@ -174,7 +174,7 @@ def entry_digest(entry: dict) -> str:
 # The audit's own integrity FLAGs, carried by kind in the witness so stripping
 # them from the anchor is detectable (R6:gap is excluded: Tier 0 sees gaps itself).
 WITNESS_R6 = ("anchor-mismatch", "anchor-forged", "anchor-behind", "anchor-unreadable", "rebaseline", "issue-moved",
-              "runs-unverifiable")
+              "runs-unverifiable", "runs-gap-suspect")
 
 
 def witness_line(entry: dict) -> str:
@@ -499,6 +499,7 @@ class Auditor:
         self.ledger: list[str] = []
         self.notes: list[str] = []
         self._slept = False
+        self.backlogs: dict[str, dict] = {}
 
     def flag(self, rule: str, key: str, summary: str) -> None:
         self.findings.append(finding(rule, key, summary))
@@ -519,10 +520,44 @@ class Auditor:
             cache[sha] = st in ("ahead", "identical")
         return cache[sha]
 
+    SECTIONS = ("commits", "records", "checks", "runs", "branches")
+
+    def begin(self, section: str) -> None:
+        """Start a budgeted section. It may use its guaranteed share
+        (`api_section_shares`) plus whatever the total budget has left after
+        the shares of the sections still to come, so no section can starve a
+        later one (verify5 V5-I1)."""
+        total = getattr(self, "call_limit", None)
+        shares = self.cfg.get("api_section_shares") or {}
+        self.section = section
+        self.section_start = self.gh.count
+        if total is None:
+            self.section_limit = None
+            return
+        later = self.SECTIONS[self.SECTIONS.index(section) + 1:]
+        reserved = sum(int(shares.get(x, 0)) for x in later)
+        self.section_limit = max(self.gh.count + int(shares.get(section, 0)), total - reserved)
+
     def over_budget(self) -> bool:
-        """The per-run API budget (shared GITHUB_TOKEN quota) or the time budget is spent."""
-        limit = getattr(self, "call_limit", None)
+        """This section's API budget (shared GITHUB_TOKEN quota) or the time budget is spent."""
+        limit = getattr(self, "section_limit", None)
+        if limit is None:
+            limit = getattr(self, "call_limit", None)
         return self.out_of_time() or (limit is not None and self.gh.count >= limit)
+
+    def backlog(self, section: str, rule: str, left: int, processed: int, detail: str) -> None:
+        """A section that could not finish: an open condition, escalated to a
+        FLAG (an event, so the front door raises a blocking item) when it
+        persists for `backlog_flag_after` runs or when the section was starved
+        to zero, naming what is waiting."""
+        st = self.backlogs.setdefault(section, {"runs": 0})
+        st["runs"] += 1
+        self.condition(rule, f"{rule}:{section}-backlog", f"{left} item(s) of {section} not yet checked "
+                                                         f"(budget or time); carried to the next run. {detail}")
+        n = int(self.cfg["backlog_flag_after"])
+        if processed == 0 or st["runs"] == n:
+            why = "starved: nothing processed this run" if processed == 0 else f"backlog for {n} runs in a row"
+            self.flag(rule, f"{rule}:{section}-backlog:{self.seq}", f"{section} check {why}; {left} waiting. {detail}")
 
     def out_of_time(self) -> bool:
         return self.deadline is not None and self.clock() >= self.deadline
@@ -886,13 +921,14 @@ class Auditor:
     def _record_like(self, author: str | None, body: str) -> bool:
         return author in set(self.cfg["trusted_record_authors"]) and bool(RECORD_LIKE_RE.search(body) or CRITICAL_LIKE_RE.search(body))
 
-    def records(self, prev: dict | None, cursor: dict | None) -> tuple[dict, dict]:
+    def records(self, prev: dict | None, cursor: dict | None, prev_backlog: dict | None = None) -> tuple[dict, dict]:
         """Returns (records, cursor). New and edited comments come from repo-wide
         `since` listings (bounded, resumable through the cursor); reviews from
         the PRs updated since the cursor; every tracked record is also
         re-fetched one by one in rotation (`record_verify_per_run`), which is
         what catches deletions, since listings never show a deleted item."""
         r = self.repo
+        self.backlogs["records"] = dict(prev_backlog or {"runs": 0})
         prev = dict(prev or {})
         horizon = self.now - timedelta(days=int(self.cfg["record_scope_days"]))
         first = cursor is None
@@ -953,8 +989,6 @@ class Auditor:
         for p in sorted(prs, key=lambda x: x.get("updated_at") or ""):
             if self.over_budget():
                 stopped = True
-                self.condition("R7", "R7:reviews-backlog", "reviews of recently updated PRs not all read (per-run API "
-                                                           "budget or time limit); the rest are read next run")
                 break
             n = p["number"]
             for c in self.gh.collect(f"repos/{r}/pulls/{n}/reviews", max_pages=pages)[0]:
@@ -964,6 +998,11 @@ class Auditor:
                         c.get("submitted_at"), None)
             if p.get("updated_at"):
                 cursor["prs"] = max(p["updated_at"], cursor.get("prs") or "")
+        if stopped:
+            done = sum(1 for p in prs if (p.get("updated_at") or "") <= (cursor.get("prs") or ""))
+            self.backlog("records", "R7", len(prs) - done, done, "Reviews of recently updated PRs, oldest update first.")
+        else:
+            self.backlogs["records"] = {"runs": 0}
         if not prs and first and not stopped:
             cursor["prs"] = iso(self.now)
         # rotation: re-fetch the least recently verified tracked records
@@ -994,7 +1033,8 @@ class Auditor:
         return snap, cursor
 
     # ---- R4: forged checks (open conditions)
-    def forged_checks(self, ok_ids: list[int], bad: dict, seen: dict | None = None) -> tuple[list[int], dict, dict]:
+    def forged_checks(self, ok_ids: list[int], bad: dict, seen: dict | None = None,
+                      prev_backlog: dict | None = None) -> tuple[list[int], dict, dict]:
         """R4 with a bounded number of check-run reads per run: open PRs whose
         head is new or changed come first, then the least recently checked.
         A PR not read this run keeps its known forged-check conditions (same
@@ -1011,13 +1051,15 @@ class Auditor:
         q = urllib.parse.urlencode({"check_name": name, "filter": "all"})
         heads = {str(p["number"]): (p.get("head") or {}).get("sha") for p in prs}
 
-        def order(p):
-            s0 = seen.get(str(p["number"])) or {}
-            return (s0.get("head") == heads[str(p["number"])], s0.get("at") or "")
+        # Never-read PRs and the least recently read ones take turns, so neither
+        # a flood of new PRs nor a backlog of old ones starves the other.
+        fresh = [p for p in prs if str(p["number"]) not in seen]
+        old = sorted((p for p in prs if str(p["number"]) in seen), key=lambda p: seen[str(p["number"])].get("at") or "")
+        mixed = [x for pair in zip(old, fresh) for x in pair] + old[len(fresh):] + fresh[len(old):]
         cap = int(self.cfg["checks_prs_per_run"])
         read = 0
         backlog = 0
-        for p in sorted(prs, key=order):
+        for p in mixed:
             n, head = str(p["number"]), heads[str(p["number"])]
             if not head:
                 continue
@@ -1041,9 +1083,11 @@ class Auditor:
                 else:
                     ok.add(cid)
             seen[n] = {"head": head, "at": iso(self.now)}
+        self.backlogs["checks"] = dict(prev_backlog or {"runs": 0})
         if backlog:
-            self.condition("R4", "R4:checks-backlog", f"{backlog} open PR(s) not re-read for forged checks this run "
-                                                      f"(per-run limit {cap} or API budget); read on later runs")
+            self.backlog("checks", "R4", backlog, read, f"Per-run limit {cap} PRs; least recently read go first.")
+        else:
+            self.backlogs["checks"] = {"runs": 0}
         seen = {k: v for k, v in seen.items() if k in heads}
         return sorted(ok)[-2000:], new_bad, seen
 
@@ -1073,7 +1117,7 @@ class Auditor:
         return f"is a job of an untrusted {vpath} run ({why})" if why else None
 
     # ---- R5: workflows run from outside the default branch
-    def foreign_runs(self, cursor: dict | None) -> dict:
+    def foreign_runs(self, cursor: dict | None, prev_backlog: dict | None = None) -> dict:
         """R5 over workflow runs since the cursor, oldest first. A run is flagged
         when the workflow file it ran (the blob at its head_sha) is neither
         main's blob at the merge base of that commit (the branch did not touch
@@ -1116,13 +1160,24 @@ class Auditor:
             return bases[sha]
 
         new = sorted((x for x in runs if int(x.get("id") or 0) > last_id), key=lambda x: int(x["id"]))
+        self.backlogs["runs"] = dict(prev_backlog or {"runs": 0})
+        # Runs left unchecked last time that are no longer listed were deleted
+        # before they could be checked: the listing is the evidence.
+        listed = {int(x.get("id") or 0) for x in runs}
+        for p in cursor.get("pending") or []:
+            if complete and int(p.get("id") or 0) not in listed:
+                self.flag("R5", f"R5:run-vanished:{p.get('id')}",
+                          f"workflow run {p.get('id')} ({p.get('path')}, ref {p.get('branch')!r}, actor {p.get('actor')!r}) "
+                          f"was listed but unchecked last run and is gone now (deleted before R5 could check it)")
         done_id, stopped_at = last_id, None
+        processed = 0
         for run in new:
             if self.over_budget():
                 stopped_at = run
                 break
             path = run.get("path") or ""
             done_id = int(run["id"])
+            processed += 1
             if not path.startswith(".github/workflows/"):
                 continue        # dynamic workflows (Pages, Dependabot): GitHub-defined
             path = path.split("@", 1)[0]
@@ -1147,21 +1202,31 @@ class Auditor:
                 continue
             base = base_of(sha)
             at_base = tree_of(base).get(path) if base else None
-            if ran is not None and ran == at_base:
+            retired = set(self.cfg.get("retired_workflow_blobs") or [])
+            # Only main's version at THIS commit's merge base, and only while main
+            # still has the file and that version is not retired (verify5 V5-M1).
+            if ran is not None and ran == at_base and path in default_blobs and ran not in retired:
                 continue        # unchanged on the branch: main's definition at the branch point
             self.flag("R5", f"R5:run:{run.get('id')}",
                       f"workflow run {run.get('id')} ({path}, event {event!r}, ref {clean(run.get('head_branch'))!r}, "
                       f"actor {(run.get('actor') or {}).get('login')!r}) ran a definition the branch changed or added "
                       f"({'absent on the default branch at the branch point' if at_base is None else 'differs from the default branch at the branch point'})")
         if stopped_at is not None:
-            left = sum(1 for x in new if int(x["id"]) > done_id)
-            self.condition("R5", "R5:runs-backlog",
-                           f"{left} workflow run(s) since {since} not yet checked (per-run API budget or time limit); "
-                           f"carried to the next run")
+            waiting = [x for x in new if int(x["id"]) > done_id]
+            cursor["pending"] = [{"id": x.get("id"), "path": clean(x.get("path"), 120), "branch": clean(x.get("head_branch"), 120),
+                                  "actor": (x.get("actor") or {}).get("login")} for x in waiting[:50]]
+            oldest = waiting[0]
+            self.backlog("runs", "R5", len(waiting), processed,
+                         f"Oldest waiting: run {oldest.get('id')} ({clean(oldest.get('path'), 120)}, ref "
+                         f"{clean(oldest.get('head_branch'), 80)!r}, actor {(oldest.get('actor') or {}).get('login')!r}, "
+                         f"created {oldest.get('created_at')})")
             cursor["id"] = done_id
             start = ts(stopped_at.get("created_at")) or self.now
             cursor["at"] = iso(start - timedelta(minutes=1))
-        elif runs:
+            return cursor
+        self.backlogs["runs"] = {"runs": 0}
+        cursor["pending"] = []
+        if runs:
             cursor["id"] = max([last_id] + [int(x.get("id") or 0) for x in runs])
             cursor["at"] = iso(self.now - timedelta(minutes=10))
         else:
@@ -1186,7 +1251,7 @@ class Auditor:
             if self.over_budget():
                 self.condition("R5", "R5:branches-backlog", "branch tips not all checked (per-run API budget or time "
                                                              "limit); the rest are checked next run")
-                break       # not recorded: re-checked next run
+                break       # not recorded: re-checked next run (runs-based R5 above is the primary check)
             cmp = self.gh.get(f"repos/{r}/compare/{urllib.parse.quote(self.default)}...{tip}")
             files = cmp.get("files") or []
             touched = [f.get("filename") for f in files
@@ -1381,7 +1446,9 @@ def load_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv, anchor: dict | Non
         nums, complete = audit_run_numbers(gh, repo, cfg, sus.get("since"))
         still = [n for n in sus["numbers"] if n not in nums]
         first = ts(sus.get("first_seen")) or a.now
-        if still and complete and a.now - first >= timedelta(minutes=5):
+        if not complete:
+            still = list(sus["numbers"])        # cannot be confirmed present: treat as missing (verify5 V5-M2)
+        if still and a.now - first >= timedelta(minutes=5):
             raise StateBroken(f"audit run number(s) {still[:10]} are still missing {int((a.now - first).total_seconds() // 60)} "
                               f"min after they were first noticed: audit runs were deleted (newer state may have been removed)")
         if still:
@@ -1630,14 +1697,21 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
         base_chain = list((state or {}).get("chain") or []) if rebaseline and rebaseline["mode"] == "continue" else []
     a.seq = seq
     head = gh.get(f"repos/{repo}/branches/{urllib.parse.quote(cfg['default_branch'])}")["commit"]["sha"]
+    bl = prev.get("backlogs") or {}
+    a.begin("commits")
     new_head = a.audit_commits(prev.get("head"), head)
     events_cursor, events_seen = a.push_events(prev.get("events_cursor"), prev.get("events_seen") or [])
     controls = a.controls(prev.get("controls"), vars_ctx)
     issue_cursor = a.label_events(prev.get("issue_events_cursor"))
-    records, records_cursor = a.records(prev.get("records") if state else None, prev.get("records_cursor") if state else None)
+    a.begin("records")
+    records, records_cursor = a.records(prev.get("records") if state else None, prev.get("records_cursor") if state else None,
+                                        bl.get("records"))
+    a.begin("checks")
     checks_ok, checks_bad, checks_seen = a.forged_checks(prev.get("checks_ok") or [], prev.get("checks_bad") or {},
-                                                         prev.get("checks_seen") or {})
-    runs_cursor = a.foreign_runs(prev.get("runs_cursor"))
+                                                         prev.get("checks_seen") or {}, bl.get("checks"))
+    a.begin("runs")
+    runs_cursor = a.foreign_runs(prev.get("runs_cursor"), bl.get("runs"))
+    a.begin("branches")
     branches = a.branch_workflows(prev.get("branches"))
     code = code_digest(gh, repo, env.workflow_sha) if env.workflow_sha else ""
     conditions = [a.conditions[k] for k in sorted(a.conditions)]
@@ -1649,7 +1723,8 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
                  "issue_events_cursor": issue_cursor, "controls": controls, "records": records,
                  "records_cursor": records_cursor, "checks_ok": checks_ok, "checks_bad": checks_bad, "checks_seen": checks_seen,
                  "runs_cursor": runs_cursor, "branches": branches, "issue": issue,
-                 "open": [c["key"] for c in conditions], "gap_suspects": getattr(a, "gap_suspects", None)}
+                 "open": [c["key"] for c in conditions], "gap_suspects": getattr(a, "gap_suspects", None),
+                 "backlogs": a.backlogs}
     ordered = sorted(a.findings, key=lambda f: f["rule"] != "R6")   # integrity FLAGs first (never capped away)
     entry = make_entry(seq, prev_digest, env, new_head, code, state_digest(new_state), ordered + new_conditions,
                        conditions, audited_at, rebaseline)
