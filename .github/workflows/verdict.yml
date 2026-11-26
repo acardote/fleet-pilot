@@ -1,0 +1,73 @@
+# review-verdict (acardote/personal-assistant-ultra#579; design: docs/design/merge-model.md section 2).
+#
+# Hard rules (tests in .github/verdict/test_verdict.py check each one):
+# - Defined and run from the default branch only. The only trigger is
+#   pull_request_target, whose workflow definition comes from the base branch,
+#   limited to PRs based on main. Never push, pull_request or workflow_dispatch:
+#   those run a definition (and code) the PR or a branch controls.
+# - Never checks out or runs PR-head code. The checkout is the default-branch
+#   commit that defined this run (github.workflow_sha); the guard step refuses
+#   any other workflow ref.
+# - Read-only token. The job writes nothing; its own conclusion is the
+#   `review-verdict` check (an API-created check run would be flagged by audit R4).
+# - The verdict function is .github/verdict/verdict.py, stdlib only, and fails
+#   closed: anything it cannot compute is a failure.
+#
+# Changing this file is a 7a change: the operator merges.
+name: review-verdict
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: review-verdict-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review-verdict:
+    name: review-verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: read
+    steps:
+      - name: Provenance
+        run: echo "workflow_ref=${GITHUB_WORKFLOW_REF} workflow_sha=${GITHUB_WORKFLOW_SHA} run_id=${GITHUB_RUN_ID} event=${GITHUB_EVENT_NAME}"
+
+      - name: Refuse a definition not on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          expected="${GITHUB_REPOSITORY}/.github/workflows/verdict.yml@refs/heads/${DEFAULT_BRANCH}"
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request_target" ] || [ "${GITHUB_WORKFLOW_REF}" != "${expected}" ]; then
+            echo "review-verdict: FAIL: event=${GITHUB_EVENT_NAME} workflow_ref=${GITHUB_WORKFLOW_REF}, expected pull_request_target from ${expected}"
+            exit 1
+          fi
+
+      - name: Check out the default-branch commit that defined this run
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/verdict
+
+      - name: Confirm the checkout is the workflow commit
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${GITHUB_WORKFLOW_SHA}" ]; then
+            echo "review-verdict: FAIL: checked out ${actual}, expected workflow_sha ${GITHUB_WORKFLOW_SHA}"
+            exit 1
+          fi
+
+      - name: Compute verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 .github/verdict/verdict.py --repo "${GITHUB_REPOSITORY}" --pr "${PR_NUMBER}" --config .github/verdict/config.json
