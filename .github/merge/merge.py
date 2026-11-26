@@ -293,15 +293,31 @@ def parse_raw_diff(out: bytes) -> list[Change]:
 #   read as shell; `just`: the justfile; npm/pnpm/yarn/bun: package.json, whose
 #   scripts are read as shell (lifecycle hooks run on install). Makefiles,
 #   justfiles, Taskfiles, Dockerfiles and compose files are also on the floor;
-# - subprocess/os.system/os.exec*/os.spawn*/runpy.run_path targets in Python,
-#   evaluated statically (literals, __file__ with .parent/.joinpath/Path(...)/
-#   os.path.join/dirname/abspath/realpath, +, f-strings, names assigned in the
-#   file). A target that is not static is bounded by what the file names: every
-#   static string or path value in it naming an existing tree file (a bare name:
-#   a file beside it) becomes an edge; if it names none, the run fails closed;
+# - subprocess/os.system/os.exec*/os.spawn*/os.posix_spawn*/pty.spawn/
+#   runpy.run_path targets in Python, evaluated statically (literals, __file__
+#   with .parent/.parents[N]/.joinpath/Path(...)/os.path.join/dirname/abspath/
+#   realpath, +, f-strings, names assigned in the file). The call is found by its
+#   name or through an alias (`import subprocess as sp`, `from subprocess import
+#   run as r`, `sp = subprocess`, `r = sp.run`, `getattr(subprocess, "run")`),
+#   and `functools.partial(subprocess.run, [...])` is read as the call. A target
+#   that is not static, `getattr(<os|subprocess|pty...>, <non-literal>)`, a
+#   bound-nothing partial, and an exec function used as a value (passed, stored)
+#   are bounded by what the file names: every static string or path value in it
+#   naming an existing tree file (a bare name: a file beside it) becomes an
+#   edge; if it names none, the run fails closed;
 # - every existing candidate of a relative reference (root and the referring
 #   file's directories), not only the first hit; and any token naming an
 #   executable-bit (100755) file in the tree.
+# Residual, measured (fleet-pilot#3 round 3): in that bound the file's own path
+# counts as a tree file it names (it does whenever the file writes its own name
+# or uses Path(__file__) in an expression), so for such a file the fallback adds
+# nothing and does not fail closed. Excluding it was tried: on PAU main two
+# derived files (tools/registry.py runs `gh_bin()`, tools/agent-gh runs a
+# `git_bin` parameter) name nothing else, and every run went red. Call shapes not
+# listed above (exec/eval of a built string, getattr on a module bound through
+# importlib) are also not seen. Both are accepted because exploiting them needs that
+# call to sit already in a derived file, every derived file is itself 7a, and
+# adding the call required an operator merge.
 # Residual, by design: a test runner's arguments (`pytest tests/`) are not edges,
 # so tests/** is not 7a unless named on the floor. Taskfile recipes are not
 # derived (a `task` invocation fails closed). JavaScript in a github-script
@@ -507,9 +523,13 @@ NPM_DIR_OPTS = {"--prefix", "-C", "--dir", "--cwd"}
 MAKE_INCLUDE_RE = re.compile(r"^[ \t]*-?s?include[ \t]+(.+)$", re.MULTILINE)
 MODULE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 SUBPROC_SHELL_CALLS = {"system", "popen", "getoutput", "getstatusoutput", "create_subprocess_shell"}
-SUBPROC_ARGV_CALLS = {"run", "call", "check_call", "check_output", "Popen", "create_subprocess_exec"}
+SUBPROC_ARGV_CALLS = {"run", "call", "check_call", "check_output", "Popen", "create_subprocess_exec",
+                      "spawn"}  # pty.spawn(argv), pexpect.spawn(cmd)
 SUBPROC_PATH_CALLS = {"execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe",
-                      "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle", "spawnlp", "spawnlpe"}
+                      "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle", "spawnlp", "spawnlpe",
+                      "posix_spawn", "posix_spawnp", "startfile"}
+EXEC_CALLS = SUBPROC_SHELL_CALLS | SUBPROC_ARGV_CALLS | SUBPROC_PATH_CALLS
+EXEC_MODULES = {"subprocess", "os", "posix", "nt", "pty", "asyncio", "commands"}
 EXEC_MODE = "100755"
 TOPLEVEL_RE = re.compile(r"\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)")
 DYN_PATH_RE = re.compile(r"[A-Za-z0-9_.\-/${}]+")
@@ -720,6 +740,8 @@ class Deriver:
         self._pytree: ast.AST | None = None
         self._pyouter: ast.AST | None = None
         self._py_unbounded_done: set[str] = set()
+        self._pyalias: dict[str, str] = {}  # local name -> the exec function it is bound to
+        self._pymods: set[str] = set()      # local names bound to an EXEC_MODULES module
 
     # -- adding --------------------------------------------------------
     def add(self, path: str) -> bool:
@@ -1253,7 +1275,8 @@ class Deriver:
         """A derived Python file runs a command that is not static. Bound it by what the file
         can name: every static string or path value in it that names an existing tree file
         (a bare name: a file beside it) becomes an execution edge. Fail closed if the file
-        names nothing at all."""
+        names nothing at all. The file's own path counts as a name (residual, see the
+        notes above Deriver)."""
         if src in self._py_unbounded_done:
             return
         self._py_unbounded_done.add(src)
@@ -1283,7 +1306,7 @@ class Deriver:
         """subprocess / os.system / os.exec* / os.spawn*: follow the command when it is static
         (literals, __file__-relative paths, names assigned in the file); fail closed when not."""
         args = list(call.args)
-        if name.startswith("spawn"):
+        if name.startswith("spawn") and name != "spawn":
             args = args[1:]  # os.spawn*(mode, path, ...)
         if not args:
             return
@@ -1409,7 +1432,7 @@ class Deriver:
     # -- Python path values --------------------------------------------
     def _py_value(self, node: ast.AST | None, depth: int = 0) -> list[str] | None:
         """Evaluate a Python string or path expression statically: literals, __file__,
-        Path(...), .parent, .joinpath(...), /, os.path.join/dirname/abspath/realpath, str(),
+        Path(...), .parent, .parents[N], .joinpath(...), /, os.path.join/dirname/abspath/realpath, str(),
         + and f-strings, and names assigned in the same file. Paths built from __file__ come
         out repo-relative ("." is the root). None if any part is not static."""
         if node is None or depth > 8:
@@ -1429,6 +1452,15 @@ class Deriver:
         if isinstance(node, ast.Attribute) and node.attr == "parent":
             r = self._py_value(node.value, depth + 1)
             return None if r is None else [_pdir(x) for x in r]
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) \
+                and node.value.attr == "parents" and isinstance(node.slice, ast.Constant) \
+                and type(node.slice.value) is int and 0 <= node.slice.value < 32:
+            r = self._py_value(node.value.value, depth + 1)
+            if r is None:
+                return None
+            for _ in range(node.slice.value + 1):
+                r = [_pdir(x) for x in r]
+            return r
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             return self._py_join([node.left, node.right], depth)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -1514,10 +1546,11 @@ class Deriver:
             self.report(f"cannot parse as Python ({type(e).__name__})")
             return
         pkg = posixpath.dirname(src)
-        saved = (self._pyenv, self.cur_py, self._pytree, self._pyouter)
+        saved = (self._pyenv, self.cur_py, self._pytree, self._pyouter, self._pyalias, self._pymods)
         # Inline code (`python -c`, a here-document) run by a Python file belongs to that file.
         self._pyouter = saved[2] if saved[1] == src else None
         self._pyenv, self.cur_py, self._pytree = {}, src, tree
+        self._pyalias, self._pymods = {}, set(EXEC_MODULES)
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 self._pyenv.setdefault(node.targets[0].id, []).append(node.value)
@@ -1534,10 +1567,59 @@ class Deriver:
                     for nm in ast.walk(tgt):
                         if isinstance(nm, ast.Name):
                             self._pyenv.setdefault(nm.id, []).append(ast.Name(id="__unknown__"))
+        self._py_aliases(tree)
         try:
             self._scan_python_tree(src, tree, pkg)
         finally:
-            self._pyenv, self.cur_py, self._pytree, self._pyouter = saved
+            self._pyenv, self.cur_py, self._pytree, self._pyouter, self._pyalias, self._pymods = saved
+
+    def _py_aliases(self, tree: ast.AST) -> None:
+        """Names bound to an exec module or function: `import subprocess as sp`,
+        `from subprocess import run as r`, `sp = subprocess`, `r = sp.run`,
+        `r = getattr(subprocess, "run")` (followed through chains of such assignments)."""
+        assigns: list[tuple[str, ast.AST]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name in EXEC_MODULES:
+                        self._pymods.add(a.asname or a.name)
+            elif isinstance(node, ast.ImportFrom) and node.module in EXEC_MODULES and not node.level:
+                for a in node.names:
+                    if a.name in EXEC_CALLS:
+                        self._pyalias[a.asname or a.name] = a.name
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        assigns.append((t.id, node.value))
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and isinstance(node.target, ast.Name) \
+                    and node.value is not None:
+                assigns.append((node.target.id, node.value))
+        for _ in range(MAX_CMD_DEPTH):
+            grew = False
+            for tgt, val in assigns:
+                if isinstance(val, ast.Name) and val.id in self._pymods and tgt not in self._pymods:
+                    self._pymods.add(tgt)
+                    grew = True
+                fn = self._py_exec_fn(val)
+                if fn and self._pyalias.get(tgt) != fn:
+                    self._pyalias[tgt] = fn
+                    grew = True
+            if not grew:
+                break
+
+    def _py_exec_fn(self, node: ast.AST) -> str | None:
+        """The exec function an expression refers to (`subprocess.run`, `sp.run`, an alias name,
+        `getattr(os, "system")`), or None."""
+        if isinstance(node, ast.Attribute) and node.attr in EXEC_CALLS and \
+                isinstance(node.value, ast.Name) and node.value.id in self._pymods:
+            return node.attr
+        if isinstance(node, ast.Name):
+            return self._pyalias.get(node.id)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" \
+                and len(node.args) >= 2 and isinstance(node.args[0], ast.Name) and node.args[0].id in self._pymods \
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value in EXEC_CALLS:
+            return node.args[1].value
+        return None
 
     def _scan_python_tree(self, src: str, tree: ast.AST, pkg: str) -> None:
         docstrings = set()
@@ -1548,6 +1630,15 @@ class Deriver:
                 docstrings.add(id(body[0].value))
         dynamic: list[tuple[ast.Call, str]] = []
         literal_hits = 0
+        used: set[int] = set()  # exec-function references that are resolved below
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                used.add(id(node.func))
+            elif isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
+                used.add(id(node.value))  # an alias, resolved by _py_aliases
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and isinstance(node.target, ast.Name) \
+                    and node.value is not None:
+                used.add(id(node.value))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
@@ -1561,8 +1652,26 @@ class Deriver:
             elif isinstance(node, ast.Call):
                 fn = node.func
                 name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else None
-                if name in SUBPROC_SHELL_CALLS or name in SUBPROC_ARGV_CALLS or name in SUBPROC_PATH_CALLS:
+                name = self._py_exec_fn(fn) or name
+                if isinstance(fn, ast.Attribute) and fn.attr in self._pyalias:
+                    name = self._pyalias[fn.attr]  # `r = subprocess.run` in a class body, called as self.r(...)
+                if name in EXEC_CALLS:
                     self._py_subprocess(node, name, src)
+                elif name == "partial" and node.args:
+                    # functools.partial(subprocess.run, [...]): the bound arguments are the call's.
+                    inner = node.args[0]
+                    iname = self._py_exec_fn(inner) or (inner.attr if isinstance(inner, ast.Attribute) else None)
+                    if iname in EXEC_CALLS:
+                        used.add(id(inner))
+                        if len(node.args) > 1:
+                            self._py_subprocess(ast.Call(func=inner, args=node.args[1:], keywords=node.keywords),
+                                                iname, src)
+                        else:
+                            self._py_unbounded(f"partial({iname})", src)
+                elif name == "getattr" and len(node.args) >= 2 and isinstance(node.args[0], ast.Name) \
+                        and node.args[0].id in self._pymods and not (
+                            isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)):
+                    self._py_unbounded(f"getattr({node.args[0].id}, <non-literal>)", src)
                 if name in DYNAMIC_CALLS:
                     dynamic.append((node, name))
                 elif name in ("join", "Path", "PurePath", "PurePosixPath"):
@@ -1575,6 +1684,12 @@ class Deriver:
                     tok = _clean(raw)
                     if "$" not in tok and path_like(tok) and is_script(tok) and self.ref(tok, src):
                         literal_hits += 1
+        for node in ast.walk(tree):
+            # An exec function used as a value (passed, stored, returned): its call is not seen.
+            if isinstance(node, (ast.Attribute, ast.Name, ast.Call)) and id(node) not in used:
+                ref = self._py_exec_fn(node)
+                if ref and not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)):
+                    self._py_unbounded(f"{ref} used as a value", src)
         for call, name in dynamic:
             self.resolve_dynamic(call, src, pkg, name, literal_hits)
 

@@ -530,6 +530,72 @@ def test_python_subprocess_literals_are_followed(code):
     assert "tools/run" in pats or "tools/runmod.py" in pats, code
 
 
+_PYH = "import subprocess, sys, os, functools\nfrom pathlib import Path\n"
+_HERE_RUN = "Path(__file__).parent / 'run'"
+
+
+@pytest.mark.parametrize("code,target", [
+    ("subprocess.run([str(Path(__file__).parents[1] / 'scripts' / 'y')])", "scripts/y"),
+    ("subprocess.run([str(Path(__file__).resolve().parents[1] / 'scripts' / 'y')])", "scripts/y"),
+    ("ROOT = Path(__file__).resolve().parents[1]\nsubprocess.run([str(ROOT / 'scripts' / 'y')])", "scripts/y"),
+    ("subprocess.run([str(Path(__file__).parents[0] / 'run')])", "tools/run"),
+    ("subprocess.run([str(Path(__file__).parents[1] / 'deploy-it')])", "deploy-it"),
+])
+def test_python_parents_index_is_evaluated(code, target):
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/x.py"), "tools/x.py": _PYH + code,
+                               "tools/run": "echo\n", "scripts/y": "echo\n", "deploy-it": "echo\n"})
+    assert unresolved == [], unresolved
+    assert V.matches_any(target, pats), code
+
+
+@pytest.mark.parametrize("code", [
+    f"getattr(subprocess, 'run')([str({_HERE_RUN})])",
+    f"getattr(os, 'system')(str({_HERE_RUN}))",
+    f"r = subprocess.run\nr([str({_HERE_RUN})])",
+    f"from subprocess import run as r\nr([str({_HERE_RUN})])",
+    f"import subprocess as sp\nsp.run([str({_HERE_RUN})])",
+    f"sp = subprocess\nr = sp.check_call\nr([str({_HERE_RUN})])",
+    f"r = getattr(subprocess, 'Popen')\nr([str({_HERE_RUN})])",
+    f"functools.partial(subprocess.run, [str({_HERE_RUN})])()",
+    f"from functools import partial\npartial(subprocess.run, [str({_HERE_RUN})], check=True)()",
+    f"import pty\npty.spawn([str({_HERE_RUN})])",
+    f"os.posix_spawn(str({_HERE_RUN}), ['run'], os.environ)",
+    f"os.posix_spawnp(str({_HERE_RUN}), ['run'], os.environ)",
+    f"class C:\n    r = subprocess.run\n    def go(self):\n        self.r([str({_HERE_RUN})])\n",
+    "getattr(subprocess, 'run')(['tools/' + 'ru' + 'n'])",
+])
+def test_python_exec_aliases_and_forms_are_followed(code):
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/x.py"), "tools/x.py": _PYH + code,
+                               "tools/run": "echo\n"})
+    assert unresolved == [], unresolved
+    assert V.matches_any("tools/run", pats), code
+
+
+@pytest.mark.parametrize("code", [
+    "getattr(subprocess, sys.argv[1])(['x'])",
+    "import subprocess as sp\nfn = sys.argv[1]\ngetattr(sp, fn)(['x'])",
+    "functools.partial(subprocess.run)(sys.argv[1:])",
+    "def go(f):\n    f(sys.argv[1:])\ngo(subprocess.run)",
+    "TABLE = {'r': subprocess.run}\nTABLE['r'](sys.argv[1:])",
+    "from subprocess import run as r\nhooks = [r]\nhooks[0](sys.argv[1:])",
+])
+def test_python_unresolvable_exec_shapes_use_the_fallback(code):
+    # Names nothing: fails closed.
+    _, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/x.py"), "tools/x.py": _PYH + code})
+    assert unresolved and "tools/x.py" in unresolved[0], (code, unresolved)
+    # Names a tree file statically: that file becomes 7a.
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/x.py"),
+                               "tools/x.py": _PYH + "TARGET = 'tools/run'\n" + code, "tools/run": "echo\n"})
+    assert unresolved == [], (code, unresolved)
+    assert V.matches_any("tools/run", pats), code
+
+
+def test_python_exec_shapes_do_not_flag_unrelated_getattr_or_names():
+    code = _PYH + "x = getattr(os, 'environ')\nrun = 3\ncall = run + 1\nprint(subprocess.DEVNULL)\n"
+    _, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/x.py"), "tools/x.py": code})
+    assert unresolved == [], unresolved
+
+
 # --------------------------------------------------------------------------
 # End to end with real git: fake GitHub API, fake `gh pr merge`
 # --------------------------------------------------------------------------
