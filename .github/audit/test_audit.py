@@ -101,10 +101,17 @@ class FakeGH(au.GitHub):
         return {}
 
 
-def logzip(*lines: str) -> bytes:
+DEFINED_MAIN = f"{REPO}/.github/workflows/merge.yml@refs/heads/main"
+
+
+def logzip(*lines: str, defined: str | None = DEFINED_MAIN) -> bytes:
+    """A run log archive: the steps' lines, and the service-written system.txt
+    naming the definition (None: no such line)."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
         z.writestr("merge/1_merge.txt", "\n".join(f"2026-11-27T11:29:59.1234567Z {x}" for x in lines))
+        if defined is not None:
+            z.writestr("merge/system.txt", f"2026-11-27T11:29:00.0000000Z Job defined at: {defined}\n")
     return buf.getvalue()
 
 
@@ -225,7 +232,6 @@ def test_merge_by_other_workflow_is_flagged():
 
 @pytest.mark.parametrize("run", [
     merge_run(event="schedule", branch="ws/x"),
-    merge_run(event="pull_request_target", prs=[]),
     merge_run(event="pull_request_target", prs=[{"number": 5, "base": {"ref": "ws/x"}}]),
     merge_run(event="push"),
     merge_run(path=".github/workflows/other.yml"),
@@ -660,6 +666,8 @@ def checks_world(cr, job, run=None):
     r[f"repos/{REPO}/actions/runs/55"] = run or {"id": 55, "path": ".github/workflows/verdict.yml",
                                                  "event": "pull_request_target", "repository": {"full_name": REPO},
                                                  "pull_requests": [{"number": 5, "base": {"ref": "main"}}]}
+    r[f"repos/{REPO}/actions/runs/55/logs"] = verdict_logs([f"2026-11-27T11:00:00.0000000Z Job defined at: "
+                                                            f"{REPO}/.github/workflows/verdict.yml@refs/heads/main"])
     return r
 
 
@@ -686,7 +694,7 @@ def test_forged_checks(cr, job, run, flagged):
     a = auditor(checks_world(cr, job, run))
     ok, bad, _ = a.forged_checks([], {})
     assert bool(a.conditions) is flagged
-    assert (77 in ok) is (not flagged and cr["status"] == "completed")
+    assert (f"77:{cr.get('conclusion')}" in ok) is (not flagged and cr["status"] == "completed")
 
 
 def test_forged_check_stays_open_without_refetching():
@@ -1610,14 +1618,15 @@ def test_an_r5_backlog_older_than_30_minutes_flags_the_oldest_run():
 LIVE = json.loads((HERE / "live_shapes_pr10.json").read_text())
 
 
-def live_world(pr=None, run=None):
+def live_world(pr=None, run=None, system=None):
     m = LIVE["merge_commit"]
     pr = copy.deepcopy(pr or LIVE["pr"])
     run = copy.deepcopy(run or LIVE["merge_run"])
     lines = "\n".join(LIVE["merge_log_lines"])
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("merge/5_Merge.txt", lines)
+        z.writestr("auto-merge/6_Recompute verdicts inline and merge.txt", lines)
+        z.writestr("auto-merge/system.txt", "\n".join(system or LIVE["merge_system_lines"]))
     return world(**{
         f"repos/{REPO}/compare/{m['parents'][0]}...{m['sha']}": cmp([commit(m["sha"], m["parents"])], base=m["parents"][0]),
         f"repos/{REPO}/commits/{m['sha']}/pulls": [{"number": 10, "merged_at": pr["merged_at"], "merge_commit_sha": m["sha"]}],
@@ -1644,39 +1653,79 @@ def test_live_bot_merge_with_empty_pull_requests_is_verified():
     assert a.findings == [] and "verified by run 45892436548" in a.ledger[-1]
 
 
-@pytest.mark.parametrize("mutate,why", [
-    (lambda pr, run: pr["head"].update(repo={"full_name": "evil/fork"}), "fork"),
-    (lambda pr, run: pr["head"].update(repo=None), "fork"),
-    (lambda pr, run: pr["base"].update(ref="ws/other"), "not main"),
-    (lambda pr, run: run.update(head_sha="c" * 40), "not PR #10's head"),
-    (lambda pr, run: run.update(head_branch="ws/other"), "not PR #10's head"),
-])
-def test_live_shape_still_refuses_forks_other_bases_and_other_heads(mutate, why):
-    pr, run = copy.deepcopy(LIVE["pr"]), copy.deepcopy(LIVE["merge_run"])
-    mutate(pr, run)
-    a = live_audit(pr=pr, run=run)
-    assert rules_of(a) == ["R1:provenance"] and why.split()[0] in a.findings[0]["summary"]
-
-
-def test_a_base_change_after_the_run_makes_it_untrusted():
-    r = live_world()
-    r[f"repos/{REPO}/issues/10/events"] = [{"event": "base_ref_changed", "created_at": "2026-11-26T20:38:00Z"}]
+def live_with_system(lines, run=None):
     m = LIVE["merge_commit"]
+    a = au.Auditor(FakeGH(live_world(run=run, system=lines)), REPO, CFG,
+                   now=datetime(2026, 11, 26, 20, 50, tzinfo=timezone.utc), sleep=lambda s: None)
+    a.audit_commits(m["parents"][0], m["sha"])
+    return a
+
+
+def test_a_sibling_pr_run_defined_on_another_base_is_refused():
+    """fp14 wario C1: a closed sibling PR (same head, base `evil`) ran merge.yml from `evil`; its run
+    metadata is identical to a main run once pull_requests[] is empty. The service-written definition
+    line in system.txt tells them apart."""
+    evil = [x.replace("@refs/heads/main", "@refs/heads/evil") for x in LIVE["merge_system_lines"]]
+    a = live_with_system(evil)
+    assert rules_of(a) == ["R1:provenance"] and "refs/heads/evil" in a.findings[0]["summary"]
+
+
+def test_a_definition_line_printed_by_a_step_does_not_count():
+    """Only <job>/system.txt (no step writes it) is read; a step printing the same text proves nothing."""
+    m = LIVE["merge_commit"]
+    r = live_world()
+    line = "2026-11-26T20:38:11.0000000Z Job defined at: acardote/fleet-pilot/.github/workflows/merge.yml@refs/heads/main"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("auto-merge/6_Recompute verdicts inline and merge.txt", "\n".join(LIVE["merge_log_lines"] + [line]))
+        z.writestr("auto-merge/system.txt", "2026-11-26T20:37:54.2510000Z Requested labels: ubuntu-latest")
+        z.writestr("auto-merge/7_system.txt", line)
+        z.writestr("0_auto-merge.txt", line)
+    r[f"repos/{REPO}/actions/runs/{LIVE['merge_run']['id']}/logs"] = buf.getvalue()
     a = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 26, 20, 50, tzinfo=timezone.utc), sleep=lambda s: None)
     a.audit_commits(m["parents"][0], m["sha"])
-    assert rules_of(a) == ["R1:provenance"] and "base changed after" in a.findings[0]["summary"]
+    assert rules_of(a) == ["R1:provenance"] and "definition unproven" in a.findings[0]["summary"]
 
 
-def r4_world(job=None, pr=None):
+def test_a_run_triggered_by_another_pr_proves_the_merge_it_logged():
+    """fp14 challenger I3: merge.py merges every labelled PR; a run triggered by PR Y that merged PR #10
+    proves #10's merge through its own MERGED line."""
+    run = dict(copy.deepcopy(LIVE["merge_run"]), head_branch="ws/other-pr", head_sha="c" * 40)
+    a = live_with_system(LIVE["merge_system_lines"], run=run)
+    assert a.findings == [] and "verified by run 45892436548" in a.ledger[-1]
+
+
+def test_a_listed_pr_on_another_base_is_still_refused_by_metadata():
+    run = dict(copy.deepcopy(LIVE["merge_run"]), pull_requests=[{"number": 11, "base": {"ref": "evil"}}])
+    a = live_with_system(LIVE["merge_system_lines"], run=run)
+    assert rules_of(a) == ["R1:provenance"]
+
+
+def test_a_merge_run_log_without_the_definition_line_proves_nothing():
+    a = auditor(world(**{f"repos/{REPO}/actions/runs/100/logs": logzip(
+        f"VERDICT-RECOMPUTED pr=5 head={H1} result=pass", f"MERGED pr=5 head={H1} run_id=100 workflow_ref={REF}",
+        defined=None)}))
+    a.audit_commits(None, M1)
+    assert rules_of(a) == ["R1:provenance"] and "definition unproven" in a.findings[0]["summary"]
+
+
+def verdict_logs(lines=None):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("review-verdict/system.txt", "\n".join(lines or LIVE["verdict_system_lines"]))
+    return buf.getvalue()
+
+
+def r4_world(job=None, pr=None, cr=None, logs=None):
     pr = pr or {"number": 10, "head": {"sha": LIVE["pr"]["head"]["sha"], "ref": LIVE["pr"]["head"]["ref"],
                                        "repo": {"full_name": REPO}}, "base": {"ref": "main"}}
     job = job or LIVE["verdict_job"]
-    cr = LIVE["verdict_check_run"]
+    cr = cr or LIVE["verdict_check_run"]
     return world(**{f"repos/{REPO}/pulls": [pr],
                     f"repos/{REPO}/commits/{pr['head']['sha']}/check-runs": {"check_runs": [cr]},
                     f"repos/{REPO}/actions/jobs/{cr['id']}": job,
                     f"repos/{REPO}/actions/runs/{job['run_id']}": LIVE["verdict_run"],
-                    f"repos/{REPO}/issues/10/events": []})
+                    f"repos/{REPO}/actions/runs/{job['run_id']}/logs": logs if logs is not None else verdict_logs()})
 
 
 def test_live_verdict_check_with_empty_pull_requests_is_trusted():
@@ -1685,21 +1734,52 @@ def test_live_verdict_check_with_empty_pull_requests_is_trusted():
     assert LIVE["verdict_run"]["pull_requests"] == []
     a = auditor(r4_world())
     ok, bad, _ = a.forged_checks([], {})
-    assert a.conditions == {} and LIVE["verdict_check_run"]["id"] in ok
+    assert a.conditions == {} and f"{LIVE['verdict_check_run']['id']}:success" in ok
 
 
-def test_live_verdict_check_on_a_fork_pr_is_still_flagged():
-    pr = {"number": 10, "head": {"sha": LIVE["pr"]["head"]["sha"], "ref": LIVE["pr"]["head"]["ref"],
-                                 "repo": {"full_name": "evil/fork"}}, "base": {"ref": "main"}}
-    a = auditor(r4_world(pr=pr))
+def test_a_verdict_job_defined_on_another_base_is_flagged():
+    """fp14 wario I3: the same sibling-PR route for R4: a verdict.yml defined on `evil`."""
+    evil = [x.replace("@refs/heads/main", "@refs/heads/evil") for x in LIVE["verdict_system_lines"]]
+    a = auditor(r4_world(logs=verdict_logs(evil)))
     a.forged_checks([], {})
     assert list(a.conditions) == [f"R4:{LIVE['verdict_check_run']['id']}"]
+
+
+def test_a_check_run_whose_conclusion_differs_from_its_job_is_flagged():
+    """fp14 challenger I2 / wario I2: a cancelled job's check run PATCHed to success."""
+    job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion="cancelled")
+    cr = dict(LIVE["verdict_check_run"], conclusion="success")
+    a = auditor(r4_world(job=job, cr=cr))
+    a.forged_checks([], {})
+    assert "rewritten" in next(iter(a.conditions.values()))["summary"]
+
+
+def test_an_accepted_check_is_re_checked_when_its_conclusion_changes():
+    job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion="cancelled")
+    cr = dict(LIVE["verdict_check_run"], conclusion="cancelled")
+    a = auditor(r4_world(job=job, cr=cr))
+    ok, bad, seen = a.forged_checks([], {})
+    assert a.conditions == {} and f"{cr['id']}:cancelled" in ok
+    b = auditor(r4_world(job=job, cr=dict(cr, conclusion="success")))
+    b.forged_checks(ok, bad, {})
+    assert list(b.conditions) == [f"R4:{cr['id']}"]
+
+
+def test_an_api_created_check_run_job_of_another_workflow_is_flagged():
+    """Live forgery 140152689638: the API-created check run is a runnerless 'success' job of a ci.yml run."""
+    job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion="success", run_id=45890658605)
+    r = r4_world(job=job, cr=dict(LIVE["verdict_check_run"], conclusion="success"))
+    r[f"repos/{REPO}/actions/runs/45890658605"] = dict(LIVE["verdict_run"], id=45890658605, path=".github/workflows/ci.yml",
+                                                       event="push", head_branch="ws/refusal-3")
+    a = auditor(r)
+    a.forged_checks([], {})
+    assert "ci.yml" in next(iter(a.conditions.values()))["summary"]
 
 
 @pytest.mark.parametrize("conclusion,flagged", [("cancelled", False), ("skipped", False), ("success", True)])
 def test_a_runnerless_job_is_accepted_only_when_cancelled_or_skipped(conclusion, flagged):
     """#594: verdict.yml's concurrency cancels jobs before they get a runner (runner_name null, no steps)."""
     job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion=conclusion)
-    a = auditor(r4_world(job=job))
+    a = auditor(r4_world(job=job, cr=dict(LIVE["verdict_check_run"], conclusion=conclusion)))
     a.forged_checks([], {})
     assert bool(a.conditions) is flagged

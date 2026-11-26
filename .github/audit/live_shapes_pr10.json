@@ -1,5 +1,5 @@
 {
- "_source": "Real API shapes, trimmed, fetched 2026-11-26 from acardote/fleet-pilot (public): merge.yml run 45892436548 that merged PR #10, PR #10, verdict.yml run 45892436517 with its job and check run. pull_requests[] is empty on both runs because the PR is merged.",
+ "_source": "Real API shapes, trimmed, fetched 2026-11-26 from acardote/fleet-pilot (public): merge.yml run 45892436548 that merged PR #10, PR #10, verdict.yml run 45892436517 with its job and check run. pull_requests[] is empty on both runs because the PR is merged. The *_system_lines are from each run's log archive, <job>/system.txt (service-written).",
  "merge_run": {
   "id": 45892436548,
   "run_number": 22,
@@ -119,5 +119,15 @@
   ],
   "committer": "web-flow",
   "verified": true
- }
+ },
+ "merge_system_lines": [
+  "2026-11-26T20:37:54.2510000Z Requested labels: ubuntu-latest",
+  "2026-11-26T20:37:54.2510000Z Job defined at: acardote/fleet-pilot/.github/workflows/merge.yml@refs/heads/main",
+  "2026-11-26T20:37:54.2510000Z Waiting for a runner to pick up this job..."
+ ],
+ "verdict_system_lines": [
+  "2026-11-26T20:37:54.1520000Z Requested labels: ubuntu-latest",
+  "2026-11-26T20:37:54.1520000Z Job defined at: acardote/fleet-pilot/.github/workflows/verdict.yml@refs/heads/main",
+  "2026-11-26T20:37:54.1520000Z Waiting for a runner to pick up this job..."
+ ]
 }
