@@ -1,0 +1,94 @@
+# merge-audit (acardote/personal-assistant-ultra#581; design: docs/design/merge-model.md section 4).
+#
+# Detection, not prevention. Flags every default-branch merge not made by a
+# default-branch merge.yml run that logged its inline verdict recomputation for
+# the merged head (R1), every other push to the default branch (R2), control
+# changes (R3), forged review-verdict checks (R4), workflow files on branches
+# (R5) and review records edited or deleted (R7). Findings go to the
+# "fleet-audit: merge audit findings" issue and the job summary.
+#
+# Hard rules (tests in .github/audit/test_audit.py check each one):
+# - Runs the default branch's definition only: triggers are push to main,
+#   schedule and workflow_dispatch, and the guard step refuses any other
+#   workflow ref. Never pull_request, pull_request_target or workflow_run.
+# - Runs only default-branch code: the checkout is github.workflow_sha.
+# - Token: read-only except issues: write (to post findings). No contents,
+#   pull-requests, actions or checks write.
+# - The previous run's state is a run-bound artifact; the script reads only
+#   artifacts uploaded by a trusted (default-branch) audit run.
+# - The front door checks from outside the repo that this workflow ran
+#   successfully in the last 30 minutes and that its blob and the script's are
+#   the pinned ones (design R6).
+#
+# Changing this file is a 7a change: the operator merges.
+name: merge-audit
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: merge-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: merge-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      actions: read
+      issues: write
+    steps:
+      - name: Provenance
+        run: echo "workflow_ref=${GITHUB_WORKFLOW_REF} workflow_sha=${GITHUB_WORKFLOW_SHA} run_id=${GITHUB_RUN_ID} event=${GITHUB_EVENT_NAME}"
+
+      - name: Refuse a definition not on the default branch
+        run: |
+          expected="${GITHUB_REPOSITORY}/.github/workflows/audit.yml@refs/heads/main"
+          case "${GITHUB_EVENT_NAME}" in
+            push|schedule|workflow_dispatch) ;;
+            *) echo "merge-audit: FAIL: event=${GITHUB_EVENT_NAME}"; exit 1 ;;
+          esac
+          if [ "${GITHUB_WORKFLOW_REF}" != "${expected}" ]; then
+            echo "merge-audit: FAIL: workflow_ref=${GITHUB_WORKFLOW_REF}, expected ${expected}"
+            exit 1
+          fi
+
+      - name: Check out the default-branch commit that defined this run
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/audit
+
+      - name: Confirm the checkout is the workflow commit
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${GITHUB_WORKFLOW_SHA}" ]; then
+            echo "merge-audit: FAIL: checked out ${actual}, expected workflow_sha ${GITHUB_WORKFLOW_SHA}"
+            exit 1
+          fi
+
+      - name: Audit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VARS_JSON: ${{ toJSON(vars) }}
+          STATE_DIR: ${{ runner.temp }}/fleet-audit
+        run: python3 .github/audit/audit.py --repo "${GITHUB_REPOSITORY}" --config .github/audit/config.json --state-out "${STATE_DIR}/state.json"
+
+      - name: Save state for the next run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fleet-audit-state
+          path: ${{ runner.temp }}/fleet-audit/state.json
+          retention-days: 90
+          if-no-files-found: error
