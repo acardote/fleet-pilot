@@ -91,8 +91,16 @@ gh workflow disable merge.yml --repo acardote/fleet-pilot
 while :; do
   left=0
   for s in in_progress queued pending waiting requested; do
-    ids=$(gh run list --repo acardote/fleet-pilot --workflow merge.yml --status $s --json databaseId --jq '.[].databaseId')
-    for id in $ids; do gh run cancel "$id" --repo acardote/fleet-pilot; left=1; done
+    if ! out=$(gh run list --repo acardote/fleet-pilot --workflow merge.yml --status "$s" --json databaseId --jq '.[].databaseId'); then
+      echo "gh run list failed for $s; retrying"; left=1; continue   # never treat an error as "none left"
+    fi
+    while read -r id; do
+      [ -n "$id" ] || continue
+      gh run cancel "$id" --repo acardote/fleet-pilot || true
+      left=1
+    done <<EOF_IDS
+$out
+EOF_IDS
   done
   [ "$left" = 0 ] && break
   sleep 5
