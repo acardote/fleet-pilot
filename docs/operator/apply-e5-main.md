@@ -79,16 +79,18 @@ Use this when `main` is wedged: `review-verdict` fails for a reason a PR cannot 
 ```sh
 ID=$(gh api repos/acardote/fleet-pilot/rulesets --jq '.[] | select(.name=="e5-main") | .id')
 # 1. Stop auto-merges first, so nothing merges while the ruleset is off.
-#    The variable alone is not enough: a merge.yml run reads it once at start and can
-#    keep merging until its 600 s deadline. So also disable the workflow and cancel
-#    every in-progress or queued run, and confirm none is left, BEFORE step 2.
+#    The variable alone is not enough: a merge.yml run reads it once at start, starts no
+#    merge call after 600 s, and a call can take up to 120 s more, so an in-flight run can
+#    merge for up to about 12 minutes. So also disable the workflow and cancel every
+#    in-progress or queued run, and confirm none is left, BEFORE step 2. Disabling
+#    merge.yml makes the audit raise an R3 workflow-state FLAG: expected here.
 gh variable set AUTO_MERGE_ENABLED --repo acardote/fleet-pilot --body false
 gh workflow disable merge.yml --repo acardote/fleet-pilot
 for s in in_progress queued; do
   gh run list --repo acardote/fleet-pilot --workflow merge.yml --status $s --json databaseId --jq '.[].databaseId' \
-    | xargs -n1 gh run cancel --repo acardote/fleet-pilot
+    | xargs -r -n1 gh run cancel --repo acardote/fleet-pilot
 done
-gh run list --repo acardote/fleet-pilot --workflow merge.yml --status in_progress --json databaseId --jq length   # expect: 0
+for s in in_progress queued; do gh run list --repo acardote/fleet-pilot --workflow merge.yml --status $s --json databaseId --jq length; done   # expect: 0 and 0
 # 2. Disable the ruleset (keeps its definition and id).
 gh api -X PUT repos/acardote/fleet-pilot/rulesets/$ID -f enforcement=disabled
 # 3. Merge the fix PR yourself.
