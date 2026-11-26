@@ -16,7 +16,8 @@ Per run (.github/workflows/merge.yml calls this from the default branch only):
   4. Verdict, recomputed INLINE in this run at the PR's current head H, by the
      same function verdict.yml runs (.github/verdict/verdict.py,
      fetch_and_compute) with the same config. No check run, commit status or
-     other workflow run's verdict is read. The recomputation is logged as a
+     other workflow run's verdict is read to decide a merge (step 7 reads
+     verdict.yml's run state only to wait or to block). The recomputation is logged as a
      VERDICT-RECOMPUTED line (the #581 audit's marker) plus context lines.
   5. 7a path check, complete and fail closed: fetch the default branch and
      refs/pull/<n>/head (into an empty bare repo; nothing is checked out or
@@ -32,10 +33,24 @@ Per run (.github/workflows/merge.yml calls this from the default branch only):
      stops (STALE-DEFINITION) and the next run uses the new definition.
   6. Kill switch (label), re-read immediately before the merge call, with the
      head, base and the `auto-merge` label.
-  7. Merge: `gh pr merge <n> --squash --match-head-commit H`. If the call fails
+  7. Wait for the required check (personal-assistant-ultra#596). Every event
+     that starts this workflow also starts verdict.yml, whose concurrency group
+     cancels and recreates the `review-verdict` check the e5-main ruleset
+     requires; merging while it is pending is refused ("base branch policy
+     prohibits the merge"). So, before the merge call, poll the verdict.yml
+     runs at H (bounded: VERDICT_WAIT_S per attempt, VERDICT_WAIT_BUDGET_S per
+     run) until all are completed. The newest must have concluded `success`,
+     or the PR is not merged. This read can only BLOCK a merge, never grant
+     one: the decision is still step 4's inline verdict (E5 recompute-inline
+     rule), and the ruleset enforces the check itself.
+  8. Merge: `gh pr merge <n> --squash --match-head-commit H`. If the call fails
      or times out, the PR is re-read: merged at H by merger_login counts as
-     merged (MERGE-CONFIRMED + MERGED); otherwise MERGE-REFUSED. The next
-     schedule run recomputes steps 2-6 from scratch.
+     merged (MERGE-CONFIRMED + MERGED). A refusal caused by the check
+     (kind=check-stale: "required status check", or "base branch policy"
+     while a verdict.yml run at H is pending or newer than the one waited on)
+     is retried ONCE in this run (MERGE-RETRY), after steps 7 and 6 again.
+     Anything else is MERGE-REFUSED. The next schedule run recomputes steps
+     2-7 from scratch.
 
 Log contract with the #581 audit (fleet-pilot#4 .github/audit/audit.py,
 MERGED_RE and VERDICT_LOG_RE): exactly these two whole lines, no PR text in them:
@@ -65,6 +80,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -1867,10 +1883,24 @@ class StaleDefinition(Exception):
 # Outcomes of process(). "error" and "refused" are systemic: they make the run red.
 MERGED_, SKIPPED, ERROR, REFUSED_ = "merged", "skipped", "error", "refused"
 
+# Step 7 (#596): wait for verdict.yml's `review-verdict` check at H before merging.
+VERDICT_WORKFLOW = "verdict.yml"
+VERDICT_PATH = ".github/workflows/verdict.yml"
+VERDICT_WAIT_S = 120         # per attempt, while a verdict.yml run at H is queued or in progress
+VERDICT_NONE_GRACE_S = 30    # per attempt, while no verdict.yml run at H exists yet
+VERDICT_POLL_S = 10
+VERDICT_WAIT_BUDGET_S = 600  # whole run (the job's timeout is 20 minutes)
+
+
+def is_check_refusal(msg: str) -> bool:
+    low = msg.lower()
+    return "required status check" in low or "base branch policy" in low
+
 
 class Runner:
     def __init__(self, ctx: Ctx, gh: Any, git: Git, verdict: Any, verdict_config: dict, config: dict,
-                 merger: Callable[[str, int, str, str], tuple[bool, str]]):
+                 merger: Callable[[str, int, str, str], tuple[bool, str]],
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
         self.ctx = ctx
         self.gh = gh
         self.git = git
@@ -1880,6 +1910,9 @@ class Runner:
         self.merger = merger
         self.base_sha: str | None = None
         self.patterns: list[str] | None = None
+        self.sleep = sleep
+        self.clock = clock
+        self.wait_budget = float(VERDICT_WAIT_BUDGET_S)
 
     def skip(self, n: int, head: str, reason: str, outcome: str = SKIPPED) -> str:
         log(f"SKIP pr={n} head={head} outcome={outcome} reason={reason}")
@@ -1922,8 +1955,46 @@ class Runner:
         if hits:
             raise StaleDefinition(f"default branch {self.base_sha} has 7a changes since workflow_sha {wsha}")
 
-    def reread_after_failed_merge(self, n: int, head: str, msg: str) -> str:
-        """A failed or timed-out `gh pr merge` may still have merged: re-read the PR (challenger I2)."""
+    def verdict_check_state(self, head: str) -> tuple[str, int | None, str]:
+        """State of verdict.yml's `review-verdict` check at H, from the Actions runs API
+        (actions: read). Returns (state, newest run id, conclusion), state one of
+        none | pending | success | concluded. Only pull_request_target runs of
+        verdict.yml at H count; the newest run (highest id) is the one the ruleset sees
+        once every run is completed. A forged or foreign run can only make this wait or
+        refuse: it never grants a merge (step 4 and the ruleset do)."""
+        runs = self.gh.paged(f"repos/{self.ctx.repo}/actions/workflows/{VERDICT_WORKFLOW}/runs"
+                             f"?head_sha={head}&event=pull_request_target", key="workflow_runs", limit=2)
+        mine = [r for r in runs if isinstance(r, dict) and r.get("path") == VERDICT_PATH
+                and r.get("head_sha") == head and r.get("event") == "pull_request_target"
+                and isinstance(r.get("id"), int)]
+        if not mine:
+            return "none", None, ""
+        if any(r.get("status") != "completed" for r in mine):
+            return "pending", None, ""
+        newest = max(mine, key=lambda r: r["id"])
+        concl = str(newest.get("conclusion"))
+        return ("success" if concl == "success" else "concluded"), newest["id"], concl
+
+    def await_verdict_check(self, n: int, head: str) -> tuple[str, int | None, str]:
+        """Poll verdict_check_state until it settles, bounded per attempt and per run."""
+        start = self.clock()
+        while True:
+            state, rid, concl = self.verdict_check_state(head)
+            waited = self.clock() - start
+            if state in ("success", "concluded"):
+                log(f"CHECK-WAIT pr={n} head={head} state={state} run={rid} conclusion={q(concl)} waited={waited:.0f}s")
+                return state, rid, concl
+            limit = VERDICT_NONE_GRACE_S if state == "none" else VERDICT_WAIT_S
+            if waited >= limit or self.wait_budget <= 0:
+                log(f"CHECK-WAIT pr={n} head={head} state={state} waited={waited:.0f}s gave_up=true "
+                    f"budget_left={max(self.wait_budget, 0):.0f}s")
+                return state, None, ""
+            self.sleep(VERDICT_POLL_S)
+            self.wait_budget -= VERDICT_POLL_S
+
+    def confirm_after_failed_merge(self, n: int, head: str, msg: str) -> str | None:
+        """A failed or timed-out `gh pr merge` may still have merged: re-read the PR (challenger I2).
+        Returns the outcome when the re-read settles it, None when the PR is still open and unmerged."""
         try:
             pr = self.gh.get(f"repos/{self.ctx.repo}/pulls/{n}")
         except Exception as e:  # noqa: BLE001
@@ -1938,11 +2009,29 @@ class Runner:
                 self.patterns = None
                 return MERGED_
             return self.skip(n, head, f"merged by another actor {q(merged_by)}; not this run")
-        kind = "check-stale" if "required status check" in msg.lower() else "other"
+        return None
+
+    def refusal_kind(self, head: str, msg: str, waited_run: int | None) -> str:
+        """check-stale: the refusal is about the required check. "required status check" always is;
+        "base branch policy" is only while a verdict.yml run at H is pending or newer than the run
+        step 7 waited on (the race of #596). Anything else, or an unreadable state, is "other"."""
+        low = msg.lower()
+        if "required status check" in low:
+            return "check-stale"
+        if "base branch policy" in low:
+            try:
+                state, rid, _ = self.verdict_check_state(head)
+            except Exception:  # noqa: BLE001 - cannot tell: not retried
+                return "other"
+            if state == "pending" or rid != waited_run:
+                return "check-stale"
+        return "other"
+
+    def log_refused(self, n: int, head: str, msg: str, kind: str) -> str:
         log(f"MERGE-REFUSED pr={n} head={head} kind={kind} reason={q(msg)}")
         if kind == "check-stale":
-            log(f"MERGE-REFUSED pr={n} hint=the review-verdict check on the PR head predates the review "
-                f"records; a PR event (relabel auto-merge) re-runs verdict.yml")
+            log(f"MERGE-REFUSED pr={n} hint=the review-verdict check on the PR head is pending or predates the "
+                f"review records; the next run retries, or a PR event (relabel auto-merge) re-runs verdict.yml")
         return REFUSED_
 
     def process(self, n: int, branch: str) -> str:
@@ -2011,27 +2100,50 @@ class Runner:
             return self.skip(n, head, "touches a 7a path; skip (operator merges)")
         log(f"7A-CLEAR pr={n} head={head} merge_base={mb} files={len(changes)}")
 
-        # 6. Label kill switch, head and base, re-read now.
-        again = self.gh.get(f"repos/{repo}/pulls/{n}")
-        now_labels = label_names(self.gh.paged(f"repos/{repo}/issues/{n}/labels"))
-        if (again.get("head") or {}).get("sha") != head:
-            return self.skip(n, head, "head moved before merge")
-        if again.get("state") != "open":
-            return self.skip(n, head, "closed before merge")
-        if (again.get("base") or {}).get("ref") != branch:
-            return self.skip(n, head, "base changed before merge")
-        if cfg["kill_label"] in now_labels:
-            return self.skip(n, head, f"{q(cfg['kill_label'])} label present (re-read before merge)")
-        if cfg["auto_merge_label"] not in now_labels or cfg["operator_merge_label"] in now_labels:
-            return self.skip(n, head, "labels changed before merge")
+        for attempt in (1, 2):
+            # 7. The required review-verdict check at H (#596): wait for it; never merge past a non-success.
+            try:
+                state, rid, concl = self.await_verdict_check(n, head)
+            except Exception as e:  # noqa: BLE001 - fail closed
+                return self.skip(n, head, f"cannot read the review-verdict check (fail closed): "
+                                 f"{q(type(e).__name__ + ': ' + str(e))}", ERROR)
+            if state == "concluded":
+                return self.skip(n, head, f"review-verdict check at H concluded {q(concl)} although the inline "
+                                 f"verdict passed; it predates the review records: relabel auto-merge to re-run "
+                                 f"verdict.yml", REFUSED_)
+            if state != "success":
+                return self.skip(n, head, f"review-verdict check at H is {state} after the bounded wait; "
+                                 f"the next run retries", REFUSED_)
 
-        # 7. Merge, pinned to H.
-        merged, msg = self.merger(repo, n, head, cfg["merge_method"])
-        if merged:
-            log_merged(n, head, self.ctx)
-            self.patterns = None  # re-fetch the tip and re-derive before the next candidate
-            return MERGED_
-        return self.reread_after_failed_merge(n, head, msg)
+            # 6. Label kill switch, head and base, re-read now (again before a retry).
+            again = self.gh.get(f"repos/{repo}/pulls/{n}")
+            now_labels = label_names(self.gh.paged(f"repos/{repo}/issues/{n}/labels"))
+            if (again.get("head") or {}).get("sha") != head:
+                return self.skip(n, head, "head moved before merge")
+            if again.get("state") != "open":
+                return self.skip(n, head, "closed before merge")
+            if (again.get("base") or {}).get("ref") != branch:
+                return self.skip(n, head, "base changed before merge")
+            if cfg["kill_label"] in now_labels:
+                return self.skip(n, head, f"{q(cfg['kill_label'])} label present (re-read before merge)")
+            if cfg["auto_merge_label"] not in now_labels or cfg["operator_merge_label"] in now_labels:
+                return self.skip(n, head, "labels changed before merge")
+
+            # 8. Merge, pinned to H.
+            merged, msg = self.merger(repo, n, head, cfg["merge_method"])
+            if merged:
+                log_merged(n, head, self.ctx)
+                self.patterns = None  # re-fetch the tip and re-derive before the next candidate
+                return MERGED_
+            settled = self.confirm_after_failed_merge(n, head, msg)
+            if settled is not None:
+                return settled
+            kind = self.refusal_kind(head, msg, rid) if is_check_refusal(msg) else "other"
+            if kind == "check-stale" and attempt == 1:
+                log(f"MERGE-RETRY pr={n} head={head} kind=check-stale reason={q(msg)}")
+                continue
+            return self.log_refused(n, head, msg, kind)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def run(self, kill_value: str | None) -> int:
         ctx = self.ctx

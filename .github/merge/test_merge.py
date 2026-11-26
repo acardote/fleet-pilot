@@ -133,7 +133,7 @@ def test_merge_code_is_stdlib_only_and_reads_no_checks():
     src = (HERE / "merge.py").read_text()
     imports = set(re.findall(r"^(?:from|import) ([\w.]+)", src, re.MULTILINE))
     allowed = {"__future__", "argparse", "ast", "base64", "importlib.util", "json", "os", "posixpath",
-               "re", "subprocess", "sys", "tempfile", "dataclasses", "pathlib", "typing"}
+               "re", "subprocess", "sys", "tempfile", "time", "dataclasses", "pathlib", "typing"}
     assert imports <= allowed, imports - allowed
     for needle in ("check-runs", "check_runs", "check-suites", "/statuses", "/status", "event_path",
                    "GITHUB_EVENT_PATH", "--admin", "--auto"):
@@ -642,9 +642,25 @@ def pr_obj(n, head, labels=("auto-merge", "weight:standard"), repo=REPO, state="
             "base": {"ref": "main", "repo": {"full_name": REPO, "default_branch": "main"}}}
 
 
+VERDICT_RUNS_RE = re.compile(rf"repos/{REPO}/actions/workflows/verdict\.yml/runs\?head_sha=([0-9a-f]{{40}})"
+                             r"&event=pull_request_target")
+
+
+def vrun(head, rid=900, status="completed", conclusion="success", path=".github/workflows/verdict.yml",
+         event="pull_request_target"):
+    return {"id": rid, "status": status, "conclusion": conclusion if status == "completed" else None,
+            "path": path, "event": event, "head_sha": head}
+
+
+def default_verdict_runs(head, i):
+    return [vrun(head)]
+
+
 class FakeGH:
-    def __init__(self, prs, labels_before_merge=None, pr_rereads=None):
+    def __init__(self, prs, labels_before_merge=None, pr_rereads=None, verdict_runs=default_verdict_runs):
         self.prs = {p["number"]: p for p in prs}
+        self.verdict_runs = verdict_runs  # (head, call index) -> verdict.yml runs at head (#596)
+        self.vreads = 0
         self.labels_before_merge = labels_before_merge or {}
         self.pr_rereads = pr_rereads or {}
         self.calls = []
@@ -666,6 +682,11 @@ class FakeGH:
 
     def paged(self, path, key=None, limit=100):
         self.calls.append(path)
+        mm = VERDICT_RUNS_RE.fullmatch(path)
+        if mm:
+            assert key == "workflow_runs"
+            self.vreads += 1
+            return self.verdict_runs(mm.group(1), self.vreads - 1)
         if path.startswith(f"repos/{REPO}/pulls?state=open&base=main"):
             return list(self.prs.values())
         mm = re.fullmatch(rf"repos/{REPO}/issues/(\d+)/labels", path)
@@ -835,7 +856,9 @@ def test_refused_merge_is_logged(origin, capsys):
     r, merges = make_runner(origin, [pr_obj(1, h)], merged_ok=False)
     assert r.run("true") == 1  # a refused merge makes the run red (challenger I2)
     out = capsys.readouterr().out
-    assert len(merges) == 1 and f"MERGE-REFUSED pr=1 head={h} kind=check-stale" in out
+    # a check-stale refusal is retried once in the run (#596), then logged
+    assert len(merges) == 2 and f"MERGE-REFUSED pr=1 head={h} kind=check-stale" in out
+    assert f"MERGE-RETRY pr=1 head={h} kind=check-stale" in out
     assert not any(x.startswith("MERGED") for x in out.splitlines())
     assert "::error title=auto-merge::" in out
 
@@ -871,6 +894,9 @@ class VerdictGH(FakeGH):
         return super().get(path)
 
     def paged(self, path, key=None, limit=100):
+        mm = VERDICT_RUNS_RE.fullmatch(path)
+        if mm:
+            return [vrun(mm.group(1))]
         if path.endswith("/pulls/1/files"):
             return [{"filename": "src/app.py", "status": "modified", "additions": 1, "deletions": 1,
                      "patch": "@@ -1 +1 @@"}]
@@ -1161,3 +1187,191 @@ def test_non_literal_command_is_bounded_by_what_the_file_names(code):
 def test_non_literal_command_in_a_file_naming_nothing_fails_closed(code):
     _, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/a.py"), "tools/a.py": code})
     assert any("non-literal command" in u for u in unresolved), unresolved
+
+
+# --------------------------------------------------------------------------
+# #596: the merge race with verdict.yml (wait for the required check, retry once)
+# --------------------------------------------------------------------------
+
+POLICY_MSG = "GraphQL: Repository rule violations found. The base branch policy prohibits the merge. (mergePullRequest)"
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = []
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+    def __call__(self):
+        return self.t
+
+
+def race_runner(origin, prs, results, verdict_runs=default_verdict_runs, **kw):
+    """A runner whose merge calls return `results` in order, with a fake clock."""
+    r, merges = make_runner(origin, prs, verdict_runs=verdict_runs, **kw)
+    seq = list(results)
+
+    def merger(repo, n, head, method):
+        merges.append((repo, n, head, method))
+        return seq.pop(0)
+    r.merger = merger
+    clock = FakeClock()
+    r.sleep, r.clock = clock.sleep, clock
+    return r, merges, clock
+
+
+def contract_lines(out, n, h):
+    lines = out.splitlines()
+    v = [x for x in lines if x.startswith(f"VERDICT-RECOMPUTED pr={n} ")]
+    mg = [x for x in lines if x.startswith(f"MERGED pr={n} ")]
+    return v, mg
+
+
+def test_waits_for_a_pending_verdict_check_then_merges(origin, capsys):
+    h = origin.heads[1]
+    runs = lambda head, i: [vrun(head, 900, "completed", "cancelled"),  # noqa: E731
+                            vrun(head, 901, "in_progress" if i < 3 else "completed")]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(True, "")], verdict_runs=runs)
+    assert r.run("true") == 0
+    out = capsys.readouterr().out
+    assert merges == [(REPO, 1, h, "squash")]
+    assert clock.sleeps == [10, 10, 10]
+    assert f"CHECK-WAIT pr=1 head={h} state=success run=901" in out
+    v, mg = contract_lines(out, 1, h)
+    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"] and len(mg) == 1
+    assert AUDIT_MERGED_RE.fullmatch(mg[0])
+
+
+def test_policy_refusal_while_check_is_recreated_is_retried_in_run(origin, capsys):
+    """fleet-pilot#15 / run 45897564151: verdict.yml's concurrency group recreated the
+    check between the wait and the merge call; the ruleset refused with "base branch policy"."""
+    h = origin.heads[1]
+
+    def runs(head, i):
+        if i == 0:
+            return [vrun(head, 900)]                       # step 7 sees the old success
+        if i == 1:
+            return [vrun(head, 900, "completed", "cancelled"), vrun(head, 901, "queued")]  # refusal: recreated
+        return [vrun(head, 900, "completed", "cancelled"), vrun(head, 901)]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG), (True, "")], verdict_runs=runs)
+    assert r.run("true") == 0  # no red run
+    out = capsys.readouterr().out
+    assert merges == [(REPO, 1, h, "squash")] * 2
+    assert f"MERGE-RETRY pr=1 head={h} kind=check-stale" in out
+    assert "MERGE-REFUSED" not in out
+    v, mg = contract_lines(out, 1, h)
+    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"]
+    assert mg == [f"MERGED pr=1 head={h} run_id=4242 workflow_ref={REF}"]
+    assert "RUN-RESULT merged=1 skipped=0 error=0 refused=0" in out
+
+
+def test_policy_refusal_with_settled_unchanged_check_is_other_and_not_retried(origin, capsys):
+    h = origin.heads[1]
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG)])
+    assert r.run("true") == 1
+    out = capsys.readouterr().out
+    assert len(merges) == 1 and "MERGE-RETRY" not in out
+    assert f"MERGE-REFUSED pr=1 head={h} kind=other" in out
+
+
+def test_retry_refused_again_is_logged_check_stale_and_red(origin, capsys):
+    h = origin.heads[1]
+    runs = lambda head, i: [vrun(head, 900 + i)]  # noqa: E731 - a new run every read: always "new"
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG), (False, POLICY_MSG)],
+                               verdict_runs=runs)
+    assert r.run("true") == 1
+    out = capsys.readouterr().out
+    assert len(merges) == 2 and out.count("MERGE-RETRY") == 1
+    assert f"MERGE-REFUSED pr=1 head={h} kind=check-stale" in out
+    assert not any(x.startswith("MERGED") for x in out.splitlines())
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "skipped", "neutral", "timed_out", "None"])
+def test_never_merges_past_a_non_success_check(origin, capsys, conclusion):
+    h = origin.heads[1]
+    runs = lambda head, i: [vrun(head, 900), vrun(head, 901, "completed", conclusion)]  # noqa: E731
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=runs)
+    assert r.run("true") == 1
+    out = capsys.readouterr().out
+    assert merges == []
+    assert f'review-verdict check at H concluded "{conclusion}"' in out
+    v, mg = contract_lines(out, 1, h)
+    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"] and mg == []
+
+
+def test_check_pending_past_the_bound_does_not_merge(origin, capsys):
+    h = origin.heads[1]
+    runs = lambda head, i: [vrun(head, 901, "in_progress")]  # noqa: E731
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=runs)
+    assert r.run("true") == 1
+    out = capsys.readouterr().out
+    assert merges == [] and sum(clock.sleeps) == m.VERDICT_WAIT_S
+    assert "gave_up=true" in out and "review-verdict check at H is pending after the bounded wait" in out
+
+
+def test_no_verdict_run_at_head_waits_a_grace_then_does_not_merge(origin, capsys):
+    h = origin.heads[1]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=lambda head, i: [])
+    assert r.run("true") == 1
+    out = capsys.readouterr().out
+    assert merges == [] and sum(clock.sleeps) == m.VERDICT_NONE_GRACE_S
+    assert "review-verdict check at H is none after the bounded wait" in out
+
+
+@pytest.mark.parametrize("bad", [{"path": ".github/workflows/ci.yml"}, {"event": "pull_request"},
+                                 {"head_sha": "0" * 40}, {"id": "901"}])
+def test_runs_of_other_workflows_events_or_heads_do_not_count(origin, capsys, bad):
+    h = origin.heads[1]
+    runs = lambda head, i: [{**vrun(head, 901), **bad}]  # noqa: E731
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=runs)
+    assert r.run("true") == 1
+    assert merges == [] and "is none after the bounded wait" in capsys.readouterr().out
+
+
+def test_wait_budget_bounds_the_whole_run(origin, capsys):
+    hs = origin.heads
+    prs = [pr_obj(i, hs[i]) for i in range(1, min(len(hs), 7))]
+    runs = lambda head, i: [vrun(head, 901, "queued")]  # noqa: E731
+    r, merges, clock = race_runner(origin, prs, [], verdict_runs=runs)
+    assert r.run("true") == 1
+    assert merges == [] and sum(clock.sleeps) <= m.VERDICT_WAIT_BUDGET_S
+    capsys.readouterr()
+
+
+def test_kill_label_added_before_the_retry_blocks_it(origin, capsys):
+    h = origin.heads[1]
+    runs = lambda head, i: [vrun(head, 900 + i)]  # noqa: E731
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG)], verdict_runs=runs)
+    reads = {"n": 0}
+    orig = r.gh.paged
+
+    def paged(path, key=None, limit=100):
+        if path == f"repos/{REPO}/issues/1/labels":
+            reads["n"] += 1
+            if reads["n"] > 1:
+                return [{"name": "auto-merge"}, {"name": "do-not-auto-merge"}]
+        return orig(path, key=key, limit=limit)
+    r.gh.paged = paged
+    assert r.run("true") == 0
+    out = capsys.readouterr().out
+    assert len(merges) == 1 and "MERGE-RETRY" in out
+    assert '"do-not-auto-merge" label present (re-read before merge)' in out
+
+
+def test_unreadable_check_state_fails_closed(origin, capsys):
+    h = origin.heads[1]
+
+    def runs(head, i):
+        raise V.VerdictError("GET repos/x/actions/workflows/verdict.yml/runs failed: HTTP 403")
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [], verdict_runs=runs)
+    assert r.run("true") == 1
+    out = capsys.readouterr().out
+    assert merges == [] and "outcome=error reason=cannot read the review-verdict check (fail closed)" in out
+
+
+def test_merge_workflow_can_read_actions_runs(wf):
+    # step 7 reads verdict.yml runs through the Actions API: needs actions: read, nothing more
+    assert wf["jobs"]["auto-merge"]["permissions"]["actions"] == "read"
