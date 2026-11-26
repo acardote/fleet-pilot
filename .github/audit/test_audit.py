@@ -658,13 +658,14 @@ def test_records_older_than_the_scope_age_out():
 
 def checks_world(cr, job, run=None):
     r = world(**{
-        f"repos/{REPO}/pulls": [{"number": 5, "head": {"sha": H1}}],
+        f"repos/{REPO}/pulls": [{"number": 5, "head": {"sha": H1}, "base": {"ref": "main"}}],
         f"repos/{REPO}/commits/{H1}/check-runs": {"check_runs": [cr]},
     })
     if job is not None:
         r[f"repos/{REPO}/actions/jobs/{cr['id']}"] = job
     r[f"repos/{REPO}/actions/runs/55"] = run or {"id": 55, "path": ".github/workflows/verdict.yml",
                                                  "event": "pull_request_target", "repository": {"full_name": REPO},
+                                                 "head_repository": {"full_name": REPO}, "head_branch": "ws/x",
                                                  "pull_requests": [{"number": 5, "base": {"ref": "main"}}]}
     r[f"repos/{REPO}/actions/runs/55/logs"] = verdict_logs([f"2026-11-27T11:00:00.0000000Z Job defined at: "
                                                             f"{REPO}/.github/workflows/verdict.yml@refs/heads/main"])
@@ -1783,3 +1784,54 @@ def test_a_runnerless_job_is_accepted_only_when_cancelled_or_skipped(conclusion,
     a = auditor(r4_world(job=job, cr=dict(LIVE["verdict_check_run"], conclusion=conclusion)))
     a.forged_checks([], {})
     assert bool(a.conditions) is flagged
+
+
+
+# ---------------------------------------------------------------- fp14 wario sim (sim_sibling.py) as tests
+
+SIB_HEAD = "582ef9be810f4b4865b56d4900ac9d6a7e9d37c1"
+
+
+def test_wario_sim_sibling_pr_run_is_not_trusted_end_to_end():
+    """wario's sim_sibling.py, end to end: sibling PR B (head ws/e5-positive, base `evil`, closed) ran a
+    modified merge.yml that merged PR #10 and printed perfect markers. Refused twice over: the
+    service-written definition line names `evil`, and PR B shows up in the same-head PR listing."""
+    evil = [x.replace("@refs/heads/main", "@refs/heads/evil") for x in LIVE["merge_system_lines"]]
+    r = live_world(system=evil)
+    m = LIVE["merge_commit"]
+    a = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 26, 20, 50, tzinfo=timezone.utc), sleep=lambda s: None)
+    a.audit_commits(m["parents"][0], m["sha"])
+    assert rules_of(a) == ["R1:provenance"] and "refs/heads/evil" in a.findings[0]["summary"]
+    # Even with a (hypothetically) main-looking definition line, the sibling PR listing refuses it.
+    r = live_world()
+    r[f"repos/{REPO}/pulls?head=acardote%3Aws%2Fe5-positive&state=all"] = [
+        {"number": 10, "base": {"ref": "main"}}, {"number": 11, "base": {"ref": "evil"}, "state": "closed"}]
+    b = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 26, 20, 50, tzinfo=timezone.utc), sleep=lambda s: None)
+    b.audit_commits(m["parents"][0], m["sha"])
+    assert rules_of(b) == ["R1:provenance"] and "based on 'evil'" in b.findings[0]["summary"]
+
+
+def test_wario_sim_fork_run_with_the_same_branch_and_commit_is_refused():
+    """sim_sibling.py line 2: head_repository is now compared."""
+    run = dict(copy.deepcopy(LIVE["merge_run"]), head_repository={"full_name": "attacker/fleet-pilot"})
+    assert "fork" in (au.merge_run_untrusted(run, REPO, "main", ".github/workflows/merge.yml") or "")
+    a = live_with_system(LIVE["merge_system_lines"], run=run)
+    assert rules_of(a) == ["R1:provenance"]
+
+
+def test_an_incomplete_same_head_pr_listing_fails_closed():
+    r = live_world()
+    r[f"repos/{REPO}/pulls?head=acardote%3Aws%2Fe5-positive&state=all"] = Incomplete([{"number": 10, "base": {"ref": "main"}}])
+    m = LIVE["merge_commit"]
+    a = au.Auditor(FakeGH(r), REPO, CFG, now=datetime(2026, 11, 26, 20, 50, tzinfo=timezone.utc), sleep=lambda s: None)
+    a.audit_commits(m["parents"][0], m["sha"])
+    assert rules_of(a) == ["R1:provenance"] and "could not all be read" in a.findings[0]["summary"]
+
+
+def test_a_verdict_run_from_a_fork_head_is_flagged():
+    vr = dict(LIVE["verdict_run"], head_repository={"full_name": "attacker/fleet-pilot"})
+    r = r4_world()
+    r[f"repos/{REPO}/actions/runs/{LIVE['verdict_job']['run_id']}"] = vr
+    a = auditor(r)
+    a.forged_checks([], {})
+    assert "fork" in next(iter(a.conditions.values()))["summary"]

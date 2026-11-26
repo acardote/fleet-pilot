@@ -434,6 +434,8 @@ def merge_run_untrusted(run: dict, repo: str, default: str, merge_path: str) -> 
         return f"path {run.get('path')!r}"
     if (run.get("repository") or {}).get("full_name") != repo:
         return "another repository"
+    if (run.get("head_repository") or {}).get("full_name") != repo:
+        return f"head repository {((run.get('head_repository') or {}).get('full_name'))!r} is not this repository (fork)"
     event = run.get("event")
     if event == "schedule":
         if run.get("head_branch") != default:
@@ -547,6 +549,7 @@ class Auditor:
         self.backlogs: dict[str, dict] = {}
         self._defined: dict = {}         # run id -> (definition proven, why)
         self._on_main_cache: dict = {}
+        self._siblings: dict = {}
 
     def flag(self, rule: str, key: str, summary: str) -> None:
         self.findings.append(finding(rule, key, summary))
@@ -584,6 +587,23 @@ class Auditor:
         later = self.SECTIONS[self.SECTIONS.index(section) + 1:]
         reserved = sum(int(shares.get(x, 0)) for x in later)
         self.section_limit = max(self.gh.count + int(shares.get(section, 0)), total - reserved)
+
+    def sibling_base(self, branch: str | None) -> str | None:
+        """Extra guard for a pull_request_target run (the definition proof is the
+        main one): any PR, open or closed, from the same head branch whose base
+        is not the default branch could have triggered it with that base's
+        definition. An incomplete listing fails closed."""
+        if not branch:
+            return "no head branch"
+        if branch not in self._siblings:
+            owner = self.repo.split("/", 1)[0]
+            q = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "all"})
+            prs, complete = self.gh.collect(f"repos/{self.repo}/pulls?{q}", max_pages=3)
+            other = sorted({(p.get("base") or {}).get("ref") for p in prs} - {self.default})
+            self._siblings[branch] = (f"a PR from head {branch!r} is based on {other[0]!r}, not {self.default}"
+                                      if other else None) if complete else \
+                f"more than 300 PRs from head {branch!r}: their bases could not all be read"
+        return self._siblings[branch]
 
     def over_budget(self) -> bool:
         """This section's API budget (shared GITHUB_TOKEN quota) or the time budget is spent."""
@@ -794,6 +814,8 @@ class Auditor:
         for run in sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True):
             rid = run.get("id")
             why = merge_run_untrusted(run, self.repo, self.default, mpath)
+            if not why and run.get("event") == "pull_request_target":
+                why = self.sibling_base(run.get("head_branch"))
             if why:
                 seen.append(f"run {rid} untrusted: {why}")
                 continue
@@ -1175,6 +1197,8 @@ class Auditor:
             return f"is a job of {run.get('path')!r}, not {vpath} (a same-named job in another workflow, or created through the API)"
         if (run.get("repository") or {}).get("full_name") != r:
             return "is a job of a run in another repository"
+        if (run.get("head_repository") or {}).get("full_name") != r:
+            return "is a job of a run whose head repository is not this repository (fork)"
         if run.get("event") != "pull_request_target":
             return f"is a job of a {vpath} run on event {run.get('event')!r} (definition not from the default branch)"
         no_runner = not job.get("runner_name") or not job.get("steps")
@@ -1183,7 +1207,7 @@ class Auditor:
                 return None
             return (f"was created through the API (runner_name={job.get('runner_name')!r}, "
                     f"steps={len(job.get('steps') or [])}, conclusion {job.get('conclusion')!r})")
-        why = pr_target_untrusted(run, self.default)
+        why = pr_target_untrusted(run, self.default) or self.sibling_base(run.get("head_branch"))
         if why:
             return f"is a job of an untrusted {vpath} run ({why})"
         cache = self._defined
