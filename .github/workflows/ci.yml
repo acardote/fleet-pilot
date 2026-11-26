@@ -1,6 +1,11 @@
 # Basic CI for the fleet-autonomy auto-merge pilot (acardote/personal-assistant-ultra#530).
 # review-verdict (#579) requires this workflow to be green at the PR head SHA.
-# Runs the repo's Python tests if there are any; otherwise succeeds.
+# Runs the repo's Python tests. Every test lives under .github/, which pytest's
+# default norecursedirs (".*") skips, so the path is explicit; pytest exits 5
+# (red) if it collects no tests. PyYAML is installed so the workflow-structure
+# tests run instead of being skipped (fleet-pilot#3 review, challenger C1/I4).
+# `python -I`: the working directory is not put on sys.path, so a root
+# pytest.py or pytest/ cannot shadow pytest (wario I-5).
 name: ci
 
 # review-verdict counts CI evidence only from PUSH runs on the PR's head branch
@@ -27,9 +32,5 @@ jobs:
           python-version: "3.12"
       - name: tests
         run: |
-          python -m pip install --quiet "pytest>=8.0"
-          if git ls-files '*test_*.py' '*_test.py' | grep -q .; then
-            python -m pytest -q -p no:cacheprovider
-          else
-            echo "no tests in this repo yet"
-          fi
+          python -m pip install --quiet "pytest>=8.0" "pyyaml>=6.0"
+          python -I -m pytest -q -p no:cacheprovider .github

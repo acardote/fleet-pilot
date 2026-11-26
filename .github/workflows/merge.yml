@@ -1,0 +1,82 @@
+# auto-merge (acardote/personal-assistant-ultra#580; design: docs/design/merge-model.md section 3).
+#
+# Hard rules (tests in .github/merge/test_merge.py check each one):
+# - Defined and run from the default branch only. Triggers: pull_request_target
+#   (definition from the base branch, limited to PRs based on main) and
+#   schedule (always the default branch). Never push, pull_request,
+#   workflow_dispatch or workflow_run: those can run a definition a branch controls.
+# - Never checks out or runs PR-head code. The checkout is the default-branch
+#   commit that defined this run (github.workflow_sha). The 7a check fetches PR
+#   objects into a private bare repo and only diffs them.
+# - Recomputes the verdict ITSELF, inline in this run, at the PR's current head
+#   (E5 recompute-inline rule): .github/verdict/verdict.py, the same function and
+#   config as verdict.yml. It never reads a check run, status or another run's result.
+# - Merges with its GITHUB_TOKEN via `gh pr merge --squash --match-head-commit <H>`,
+#   only PRs labelled `auto-merge`, never PRs touching the 7a path set.
+# - Kill switches: the repo variable AUTO_MERGE_ENABLED must be exactly `true`,
+#   and the `do-not-auto-merge` label blocks (re-read just before merging).
+#
+# Changing this file is a 7a change: the operator merges.
+name: auto-merge
+
+on:
+  pull_request_target:
+    types: [labeled, synchronize]
+    branches: [main]
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions: {}
+
+concurrency:
+  group: auto-merge
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    name: auto-merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+      actions: read
+    steps:
+      - name: Provenance
+        run: echo "workflow_ref=${GITHUB_WORKFLOW_REF} workflow_sha=${GITHUB_WORKFLOW_SHA} run_id=${GITHUB_RUN_ID} event=${GITHUB_EVENT_NAME}"
+
+      - name: Refuse a definition not on the default branch
+        run: |
+          expected="${GITHUB_REPOSITORY}/.github/workflows/merge.yml@refs/heads/main"
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request_target|schedule) ;;
+            *) echo "auto-merge: REFUSED: event=${GITHUB_EVENT_NAME}"; exit 1 ;;
+          esac
+          if [ "${GITHUB_WORKFLOW_REF}" != "${expected}" ]; then
+            echo "auto-merge: REFUSED: workflow_ref=${GITHUB_WORKFLOW_REF}, expected ${expected}"
+            exit 1
+          fi
+
+      - name: Check out the default-branch commit that defined this run
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/verdict
+            .github/merge
+
+      - name: Confirm the checkout is the workflow commit
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${GITHUB_WORKFLOW_SHA}" ]; then
+            echo "auto-merge: REFUSED: checked out ${actual}, expected workflow_sha ${GITHUB_WORKFLOW_SHA}"
+            exit 1
+          fi
+
+      - name: Recompute verdicts inline and merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTO_MERGE_ENABLED: ${{ vars.AUTO_MERGE_ENABLED }}
+        run: python3 .github/merge/merge.py --repo "${GITHUB_REPOSITORY}" --config .github/merge/config.json
