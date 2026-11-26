@@ -293,8 +293,15 @@ def parse_raw_diff(out: bytes) -> list[Change]:
 #   read as shell; `just`: the justfile; npm/pnpm/yarn/bun: package.json, whose
 #   scripts are read as shell (lifecycle hooks run on install). Makefiles,
 #   justfiles, Taskfiles, Dockerfiles and compose files are also on the floor;
-# - subprocess/os.system/os.exec* calls in Python with literal arguments, and any
-#   token naming an executable-bit (100755) file in the tree.
+# - subprocess/os.system/os.exec*/os.spawn*/runpy.run_path targets in Python,
+#   evaluated statically (literals, __file__ with .parent/.joinpath/Path(...)/
+#   os.path.join/dirname/abspath/realpath, +, f-strings, names assigned in the
+#   file). A target that is not static is bounded by what the file names: every
+#   static string or path value in it naming an existing tree file (a bare name:
+#   a file beside it) becomes an edge; if it names none, the run fails closed;
+# - every existing candidate of a relative reference (root and the referring
+#   file's directories), not only the first hit; and any token naming an
+#   executable-bit (100755) file in the tree.
 # Residual, by design: a test runner's arguments (`pytest tests/`) are not edges,
 # so tests/** is not 7a unless named on the floor. Taskfile recipes are not
 # derived (a `task` invocation fails closed). JavaScript in a github-script
@@ -618,6 +625,14 @@ def _lex_lenient(text: str) -> list[list[str]]:
     return out
 
 
+NONLITERAL = "$NONLITERAL/arg"
+
+
+def _pdir(p: str) -> str:
+    d = posixpath.dirname(posixpath.normpath(p))
+    return d or "."
+
+
 def _dedent(text: str) -> str:
     lines = text.split("\n")
     ind = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
@@ -700,6 +715,11 @@ class Deriver:
         self.cur = ""                     # file being scanned
         self._cwd = ""                    # directory of the last literal `cd` in the shell text being scanned
         self._js = False                  # scanning a github-script `script:` (JavaScript)
+        self._pyenv: dict[str, list[ast.AST]] = {}  # simple assignments in the Python file being scanned
+        self.cur_py = ""                  # the Python file whose __file__ that is
+        self._pytree: ast.AST | None = None
+        self._pyouter: ast.AST | None = None
+        self._py_unbounded_done: set[str] = set()
 
     # -- adding --------------------------------------------------------
     def add(self, path: str) -> bool:
@@ -754,9 +774,9 @@ class Deriver:
                 return True
             return False
         cands = self._candidates(rel, src)
-        for p in cands:
-            if self.add(p):
-                return True
+        hits = [p for p in cands if self.add(p)]  # every existing candidate, not the first hit
+        if hits:
+            return True
         if not absolute and PATH_CHARS.fullmatch(rel):
             # Fail closed on availability: a PR that creates this file is 7a.
             self.missing.update(cands[:2])
@@ -859,6 +879,9 @@ class Deriver:
                    what: str = "command") -> None:
         """A word the shell executes or loads: follow it if it names a repo path."""
         if not w or POSITIONAL_RE.match(w) or w.startswith("-"):
+            return
+        if w == NONLITERAL:
+            self._py_unbounded("subprocess", self.cur_py or src)
             return
         for a in self._word(w, src, env):
             if "__SUBST__" in a or "$" in a or SELFDIR in a:
@@ -1226,29 +1249,66 @@ class Deriver:
         for p in targets:
             self.add(p)  # absent: a PR that creates it is 7a by the floor (**/package.json)
 
-    def _py_subprocess(self, call: ast.Call, name: str, src: str) -> None:
-        if not call.args:
+    def _py_unbounded(self, name: str, src: str) -> None:
+        """A derived Python file runs a command that is not static. Bound it by what the file
+        can name: every static string or path value in it that names an existing tree file
+        (a bare name: a file beside it) becomes an execution edge. Fail closed if the file
+        names nothing at all."""
+        if src in self._py_unbounded_done:
             return
-        first = call.args[0]
+        self._py_unbounded_done.add(src)
+        trees = [t for t in (self._pytree, self._pyouter) if t is not None]
+        hits = 0
+        here = posixpath.dirname(src)
+        for node in (n for t in trees for n in ast.walk(t)):
+            if not (isinstance(node, (ast.Constant, ast.BinOp, ast.Call, ast.JoinedStr))):
+                continue
+            for v in self._py_value(node) or []:
+                v = v.strip()
+                if not v or "\n" in v or not PATH_CHARS.fullmatch(v):
+                    continue
+                if "/" in v:
+                    p0 = posixpath.normpath(v)
+                    cands = [] if p0.startswith(("/", "../")) or p0 == ".." else self._candidates(p0, src)
+                else:
+                    cands = [posixpath.join(here, v) if here else v]
+                for c in cands:
+                    if self.tree.get(c) not in (None, SUBMODULE_MODE) and c not in self.dirs:
+                        self.add(c)
+                        hits += 1
+        if not hits:
+            self.report(f"{name}() runs a non-literal command and the file names no tree file")
+
+    def _py_subprocess(self, call: ast.Call, name: str, src: str) -> None:
+        """subprocess / os.system / os.exec* / os.spawn*: follow the command when it is static
+        (literals, __file__-relative paths, names assigned in the file); fail closed when not."""
+        args = list(call.args)
+        if name.startswith("spawn"):
+            args = args[1:]  # os.spawn*(mode, path, ...)
+        if not args:
+            return
+        first = args[0]
         shell = name in SUBPROC_SHELL_CALLS or any(
             k.arg == "shell" and isinstance(k.value, ast.Constant) and bool(k.value.value) for k in call.keywords)
-        words: list[str] = []
-        if isinstance(first, ast.Constant) and isinstance(first.value, str):
-            if shell:
-                self._shell_commands(src, first.value, {})
-                return
-            words = [first.value]
-        elif isinstance(first, (ast.List, ast.Tuple)):
-            for e in first.elts:
-                if not (isinstance(e, ast.Constant) and isinstance(e.value, str)):
-                    break
-                words.append(e.value)
-            if shell and words:
-                self._shell_commands(src, " ".join(words), {})
-                return
         if name in SUBPROC_PATH_CALLS:
-            words = words[:1]
-        self._run_words(words, src, {}, 0)
+            vals = self._py_value(first)
+            if vals is None:
+                self._py_unbounded(name, src)
+            for v in vals or []:
+                self._py_exec_target(v, src)
+            return
+        variants = self._py_argv(first)
+        if variants is None:
+            self._py_unbounded(name, src)
+            return
+        for words in variants:
+            if shell:
+                if NONLITERAL in words:
+                    self._py_unbounded(name, src)
+                else:
+                    self._shell_commands(src, " ".join(words), {})
+                continue
+            self._run_words(words, src, {}, 0)
 
     # -- other kinds ---------------------------------------------------
     def scan_yaml(self, src: str, text: str) -> None:
@@ -1346,6 +1406,106 @@ class Deriver:
                 cands = self._candidates(tok[2:] if tok.startswith("./") else tok, src)
                 any(self.add(p) for p in cands)
 
+    # -- Python path values --------------------------------------------
+    def _py_value(self, node: ast.AST | None, depth: int = 0) -> list[str] | None:
+        """Evaluate a Python string or path expression statically: literals, __file__,
+        Path(...), .parent, .joinpath(...), /, os.path.join/dirname/abspath/realpath, str(),
+        + and f-strings, and names assigned in the same file. Paths built from __file__ come
+        out repo-relative ("." is the root). None if any part is not static."""
+        if node is None or depth > 8:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, ast.Name):
+            if node.id == "__file__":
+                return [self.cur_py]
+            out: list[str] = []
+            for v in self._pyenv.get(node.id, []):
+                r = self._py_value(v, depth + 1)
+                if r is None:
+                    return None
+                out.extend(x for x in r if x not in out)
+            return out[:MAX_EXPANSIONS] or None
+        if isinstance(node, ast.Attribute) and node.attr == "parent":
+            r = self._py_value(node.value, depth + 1)
+            return None if r is None else [_pdir(x) for x in r]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            return self._py_join([node.left, node.right], depth)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            a, b = self._py_value(node.left, depth + 1), self._py_value(node.right, depth + 1)
+            return None if a is None or b is None else [x + y for x in a for y in b][:MAX_EXPANSIONS]
+        if isinstance(node, ast.JoinedStr):
+            acc = [""]
+            for part in node.values:
+                r = self._py_value(part.value if isinstance(part, ast.FormattedValue) else part, depth + 1)
+                if r is None:
+                    return None
+                acc = [x + y for x in acc for y in r][:MAX_EXPANSIONS]
+            return acc
+        if isinstance(node, ast.Call):
+            fn = node.func
+            fname = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
+            recv = fn.value if isinstance(fn, ast.Attribute) else None
+            if fname in ("Path", "PurePath", "PurePosixPath", "PosixPath"):
+                return self._py_join(list(node.args), depth) if node.args else ["."]
+            if fname == "joinpath" and recv is not None:
+                return self._py_join([recv] + list(node.args), depth)
+            if fname == "join" and recv is not None and (
+                    (isinstance(recv, ast.Attribute) and recv.attr == "path")
+                    or (isinstance(recv, ast.Name) and recv.id in ("path", "posixpath", "osp"))):
+                return self._py_join(list(node.args), depth)
+            if fname == "dirname" and node.args:
+                r = self._py_value(node.args[0], depth + 1)
+                return None if r is None else [_pdir(x) for x in r]
+            if fname in ("abspath", "realpath", "normpath", "str", "fspath") and len(node.args) == 1:
+                return self._py_value(node.args[0], depth + 1)
+            if fname in ("resolve", "absolute", "as_posix", "__fspath__") and recv is not None and not node.args:
+                return self._py_value(recv, depth + 1)
+        return None
+
+    def _py_join(self, parts: list[ast.AST], depth: int) -> list[str] | None:
+        acc = [""]
+        for p in parts:
+            r = self._py_value(p, depth + 1)
+            if r is None:
+                return None
+            acc = [posixpath.join(x, y) if x else y for x in acc for y in r][:MAX_EXPANSIONS]
+        return acc
+
+    def _py_exec_target(self, value: str, src: str) -> None:
+        """A statically known path that Python executes or runs."""
+        if not posixpath.normpath(value).startswith(("/", "../")):
+            self._exec_path(value, src, {}, what="python exec target")
+
+    def _py_argv(self, node: ast.AST) -> list[list[str]] | None:
+        """argv variants for a subprocess-style first argument; NONLITERAL marks an unknown element.
+        None if the command itself is not static."""
+        if isinstance(node, ast.Name) and node.id in self._pyenv and all(
+                isinstance(v, (ast.List, ast.Tuple)) for v in self._pyenv[node.id]):
+            out: list[list[str]] = []
+            for v in self._pyenv[node.id]:
+                r = self._py_argv(v)
+                if r is None:
+                    return None
+                out.extend(r)
+            return out[:MAX_EXPANSIONS]
+        if isinstance(node, (ast.List, ast.Tuple)):
+            acc: list[list[str]] = [[]]
+            for k, e in enumerate(node.elts):
+                if isinstance(e, ast.Attribute) and e.attr == "executable" and \
+                        isinstance(e.value, ast.Name) and e.value.id == "sys":
+                    r: list[str] | None = ["python3"]
+                else:
+                    r = None if isinstance(e, ast.Starred) else self._py_value(e)
+                if r is None:
+                    if k == 0:
+                        return None
+                    r = [NONLITERAL]
+                acc = [a + [x] for a in acc for x in r][:MAX_EXPANSIONS]
+            return acc
+        r = self._py_value(node)
+        return None if r is None else [[x] for x in r]
+
     # -- Python --------------------------------------------------------
     def scan_python(self, src: str, text: str) -> None:
         try:
@@ -1354,6 +1514,32 @@ class Deriver:
             self.report(f"cannot parse as Python ({type(e).__name__})")
             return
         pkg = posixpath.dirname(src)
+        saved = (self._pyenv, self.cur_py, self._pytree, self._pyouter)
+        # Inline code (`python -c`, a here-document) run by a Python file belongs to that file.
+        self._pyouter = saved[2] if saved[1] == src else None
+        self._pyenv, self.cur_py, self._pytree = {}, src, tree
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                self._pyenv.setdefault(node.targets[0].id, []).append(node.value)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name):
+                if node.value is None:
+                    continue
+                if isinstance(node, ast.AugAssign):
+                    self._pyenv.setdefault(node.target.id, []).append(ast.Name(id="__unknown__"))
+                else:
+                    self._pyenv.setdefault(node.target.id, []).append(node.value)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.comprehension)):
+                for tgt in ([node.target] if hasattr(node, "target") else
+                            [i.optional_vars for i in node.items if i.optional_vars is not None]):
+                    for nm in ast.walk(tgt):
+                        if isinstance(nm, ast.Name):
+                            self._pyenv.setdefault(nm.id, []).append(ast.Name(id="__unknown__"))
+        try:
+            self._scan_python_tree(src, tree, pkg)
+        finally:
+            self._pyenv, self.cur_py, self._pytree, self._pyouter = saved
+
+    def _scan_python_tree(self, src: str, tree: ast.AST, pkg: str) -> None:
         docstrings = set()
         for node in ast.walk(tree):
             body = getattr(node, "body", None)
@@ -1441,11 +1627,22 @@ class Deriver:
             for a in list(call.args) + [k.value for k in call.keywords]:
                 if self._joined(src, self._div_chain(a) if isinstance(a, ast.BinOp) else [a]):
                     found = True
+                for v in self._py_value(a) or []:  # __file__-relative and assigned paths
+                    if "/" in v and not posixpath.normpath(v).startswith(("/", "../")):
+                        self._py_exec_target(v, src)
+                        found = True
             if found:
+                return
+            if name == "run_path":
+                self._py_unbounded(name, src)  # runs a file: bound by what the module names, or fail closed
                 return
         if literal_hits:
             # No literal target at the call, but the module names its scripts
             # literally (SCRIPT = ROOT / "tools" / "x.py"), and those are derived.
+            return
+        if self._pyouter is not None:
+            # Inline code whose target comes from the enclosing file's argv: bound it by that file.
+            self._py_unbounded(name, src)
             return
         self.report(f"dynamic {name}() reference not resolvable to a literal path")
 

@@ -1030,3 +1030,68 @@ def test_basic_auth_header_is_masked_on_actions(monkeypatch, capsys, tmp_path):
           run=lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0, b"", b""))
     basic = base64.b64encode(b"x-access-token:tok").decode()
     assert f"::add-mask::{basic}" in capsys.readouterr().out.splitlines()
+
+
+# --- Python path arithmetic (fp#3 re-verify R1) ------------------------------
+
+R1_CODE = [
+    "import os, subprocess\nsubprocess.Popen([os.path.join(os.path.dirname(__file__), 'run')])\n",
+    "import subprocess\nfrom pathlib import Path\nsubprocess.run([str(Path(__file__).parent / 'run')])\n",
+    "import subprocess\nfrom pathlib import Path\n"
+    "subprocess.run([str(Path(__file__).resolve().parent.joinpath('run'))])\n",
+    "import os, subprocess\nHERE = os.path.dirname(os.path.abspath(__file__))\n"
+    "subprocess.run([os.path.join(HERE, 'run'), '-x'])\n",
+    "import os\nos.execv(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'run'), ['run'])\n",
+    "import os\nfrom pathlib import Path\nos.spawnv(os.P_WAIT, str(Path(__file__).parent / 'run'), ['run'])\n",
+    "import subprocess\nfrom pathlib import Path\nROOT = Path(__file__).parent.parent\n"
+    "subprocess.run([ROOT / 'tools' / 'run'])\n",
+    "import subprocess\nsubprocess.run(['./run'])\n",
+    "import subprocess, os\nHERE = os.path.dirname(__file__)\nsubprocess.run(f'{HERE}/run --x', shell=True)\n",
+    "import subprocess, os\nCMD = [os.path.join(os.path.dirname(__file__), 'run'), '--x']\n"
+    "subprocess.check_call(CMD)\n",
+    "import runpy\nfrom pathlib import Path\nrunpy.run_path(str(Path(__file__).parent / 'run'))\n",
+]
+
+
+@pytest.mark.parametrize("code", R1_CODE)
+def test_python_file_relative_exec_targets_are_followed(code):
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/a.py"), "tools/a.py": code,
+                               "tools/run": "echo\n", "run": "echo root\n"})
+    assert unresolved == [], unresolved
+    assert "tools/run" in pats, code
+
+
+def test_python_interpreter_with_file_relative_script():
+    code = ("import subprocess, sys\nfrom pathlib import Path\n"
+            "subprocess.run([sys.executable, str(Path(__file__).parent / 'gen')])\n")
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/a.py"), "tools/a.py": code,
+                               "tools/gen": "#!/usr/bin/env python3\nimport os\n"})
+    assert unresolved == [] and "tools/gen" in pats
+
+
+@pytest.mark.parametrize("code", [
+    "import subprocess\nfrom pathlib import Path\nHERE = Path(__file__).parent\n"
+    "def go(cmd):\n    return subprocess.run(cmd)\ngo([HERE / 'run'])\n",
+    "import subprocess, sys\nfrom pathlib import Path\nTOOL = Path(__file__).parent / 'run'\n"
+    "def go(script):\n    return subprocess.run([sys.executable, script])\ngo(TOOL)\n",
+    "import subprocess, sys\n\ndef t(p):\n"
+    "    subprocess.run([sys.executable, '-c', 'import runpy, sys; runpy.run_path(sys.argv[1])', p])\n"
+    "t('tools/run')\n",
+])
+def test_non_literal_command_is_bounded_by_what_the_file_names(code):
+    """A command that is not static: every tree file the module names statically is an edge."""
+    pats, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/a.py"), "tools/a.py": code,
+                               "tools/run": "echo\n", "docs/a.md": "x\n"})
+    assert unresolved == [], unresolved
+    assert "tools/run" in pats
+    assert not V.matches_any("docs/a.md", pats)
+
+
+@pytest.mark.parametrize("code", [
+    "import subprocess, sys\nsubprocess.run(sys.argv[1:])\n",
+    "import os, sys\nos.system(sys.argv[1])\n",
+    "import os, sys\nos.execv(sys.argv[1], sys.argv[1:])\n",
+])
+def test_non_literal_command_in_a_file_naming_nothing_fails_closed(code):
+    _, unresolved = derive({".github/workflows/ci.yml": wf_run("python3 tools/a.py"), "tools/a.py": code})
+    assert any("non-literal command" in u for u in unresolved), unresolved
