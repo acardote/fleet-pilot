@@ -20,7 +20,7 @@ Each section names the file it describes. Those files on `main` are the authorit
 
 **If you push again**, the head SHA changes. `VERDICT` records for the old SHA no longer count, CI must pass again, and the review step starts again at the new head. An open `CRITICAL` keeps blocking across pushes until it is closed (see [Criticals](#criticals)). The `auto-merge` label stays on through a push, and the push itself re-runs the `review-verdict` check before the new records exist, so that check fails. After the new records are posted, remove `auto-merge` and add it again. Alternatively, remove the label before you push.
 
-**If the PR conflicts with `main`**, or the merge call is refused for any other reason, the fix is a new push, with everything above. The ruleset does not require your branch to be up to date with `main` (`strict_required_status_checks_policy` is `false`), and CI is evidence about your head commit alone, not about it merged with `main`.
+**If the PR conflicts with `main`**, the fix is a new push, with everything above. For any other refused merge, read the `MERGE-REFUSED` reason first: the next scheduled run recomputes everything and retries, so push only if the reason is about your code. The ruleset does not require your branch to be up to date with `main` (`strict_required_status_checks_policy` is `false`), and CI is evidence about your head commit alone, not about it merged with `main`.
 
 Sources: `.github/merge/merge.py` (module docstring, steps 1 to 8), `.github/verdict/verdict.py` (module docstring, conditions 0 to 5), `.github/workflows/ci.yml`, `.github/workflows/verdict.yml`, `.github/rulesets/e5-main.json`.
 
@@ -34,7 +34,7 @@ The verdict also works out an objective weight from the diff and never accepts a
 |---|---|
 | `trivial` | at most 49 changed lines (additions plus deletions) and 1 file |
 | `standard` | more than 49 changed lines, or more than 1 file, and at most 500 changed lines |
-| `heavy` | more than 500 changed lines; or any changed file on the security-boundary list (`heavy_paths`); or a changed symlink or submodule; or any changed file with no patch and 0 changed lines (a binary file, a mode-only change, a pure rename, an empty new file); or any symlink anywhere in the tree at a `heavy_paths` location |
+| `heavy` | more than 500 changed lines; or any changed file on the security-boundary list (`heavy_paths`); or a changed symlink or submodule; or any added or modified file with no patch and 0 changed lines (a binary file, a mode-only change, a pure rename, an empty new file); or any symlink anywhere in the tree at a `heavy_paths` location |
 
 A rename counts both the old and the new path, so a one-file rename is at least `standard`, and a rename with no edits is `heavy`. `heavy_paths` is matched case-insensitively after Unicode normalisation. One pattern there, `**/*lock*`, matches any file with "lock" in its name (for example `clock.py`); the same pattern is also in the 7a floor list, so such a PR never auto-merges either.
 
@@ -92,7 +92,7 @@ A live line whose first word is `critical`, or that names critical next to an `i
 - An issue comment or inline review comment that holds record-like text and was edited after posting fails the verdict.
 - Any edit of an issue comment or inline review comment by `acardote-fleet[bot]` fails it too, whatever the comment now says.
 - Posting a new record does not clear either failure. Post the records again in a new comment **and delete the edited one**. The merge audit flags deleted record comments for the operator.
-- Edits of a submitted review body are not detected by the verdict; only the audit can catch them. Do not rely on a review body as unchangeable evidence.
+- Edits of a submitted review body are not detected by the verdict; only the audit can catch them, and only after the fact. Do not rely on a review body as unchangeable evidence.
 
 To change your mind, post a new record in a new comment. Do not edit the old one.
 
@@ -104,7 +104,7 @@ The `review-verdict` check (`verdict.yml`) runs on PR events only: opened, synch
 
 `merge.yml` recomputes the verdict inline and does not trust the check to grant a merge. But before merging, it waits for the newest `review-verdict` run at your head and never merges past one that did not succeed, and the `e5-main` ruleset also requires that check at merge time.
 
-If you add `auto-merge` before the records are in, the check fails at that event. Later, when the inline verdict passes, `merge.yml` skips the PR with a line like `SKIP pr=<n> ... reason=review-verdict check at H concluded 'failure' although the inline verdict passed ... relabel auto-merge to re-run verdict.yml`. The run stays green, and **every later scheduled run skips the PR the same way**: nothing re-runs the check until a PR event. Remove the `auto-merge` label and add it again. That is a new PR event, so `verdict.yml` runs again with the records in place.
+If you add `auto-merge` before the records are in, the check fails at that event. Later, when the inline verdict passes, `merge.yml` skips the PR with a `SKIP pr=<n> head=<H> outcome=skipped` line whose reason contains `review-verdict check at H concluded` (search the run log for that text). The run stays green, and **every later scheduled run skips the PR the same way**: nothing re-runs the check until a PR event. Remove the `auto-merge` label and add it again. That is a new PR event, so `verdict.yml` runs again with the records in place.
 
 `merge.yml` starts on the `labeled` and `synchronize` events of PRs based on `main`, and on a 5-minute schedule (GitHub runs schedules on a best-effort basis). A scheduled run helps when the check was still running at the last attempt. It does not help when the check failed.
 
@@ -159,7 +159,7 @@ These are operator controls. The operator's setup guide says no agent applies th
 | Disable `merge.yml` and cancel its runs | Immediate stop: no new runs, and the current runs end. |
 | Break-glass: disable the `e5-main` ruleset | Only when `main` is wedged (the verdict machinery itself is broken, so no PR, the fix included, can pass). Before disabling the ruleset, the operator sets the variable to `false`, disables `merge.yml`, cancels every unfinished run and confirms none is left. Then the operator merges the fix by hand and re-enables the ruleset. |
 
-The labels are flags, not authority: anyone with write access can add or remove them. The merge audit (`audit.yml`) checks every merge to `main` and reports label, setting and workflow-state changes, and edited or deleted review records.
+The labels are flags, not authority: anyone with write access can add or remove them. The merge audit (`audit.yml`) checks every merge to `main` and reports changes to the kill-switch label, settings and workflow state, and edited or deleted review records.
 
 Sources: `.github/merge/merge.py` (docstring steps 2, 6 and 7, `RUN_DEADLINE_S`), `.github/merge/config.json` (`kill_label`), `docs/operator/apply-e5-main.md` (introduction and sections 5, 6 and 8), `.github/workflows/audit.yml`.
 
