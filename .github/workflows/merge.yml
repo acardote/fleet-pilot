@@ -10,7 +10,9 @@
 #   objects into a private bare repo and only diffs them.
 # - Recomputes the verdict ITSELF, inline in this run, at the PR's current head
 #   (E5 recompute-inline rule): .github/verdict/verdict.py, the same function and
-#   config as verdict.yml. It never reads a check run, status or another run's result.
+#   config as verdict.yml. No check run, status or other run's result grants a merge.
+#   Before merging it waits (bounded) for verdict.yml's run at the head to complete,
+#   and never merges past a non-success there: that read can only block (#596).
 # - Merges with its GITHUB_TOKEN via `gh pr merge --squash --match-head-commit <H>`,
 #   only PRs labelled `auto-merge`, never PRs touching the 7a path set.
 # - Kill switches: the repo variable AUTO_MERGE_ENABLED must be exactly `true`,

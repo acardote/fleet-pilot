@@ -79,14 +79,41 @@ Use this when `main` is wedged: `review-verdict` fails for a reason a PR cannot 
 ```sh
 ID=$(gh api repos/acardote/fleet-pilot/rulesets --jq '.[] | select(.name=="e5-main") | .id')
 # 1. Stop auto-merges first, so nothing merges while the ruleset is off.
+#    The variable alone is not enough: a merge.yml run reads it once at start, starts no
+#    merge call after 600 s, and a call can take up to 120 s more, so an in-flight run can
+#    merge for up to about 12 minutes. So also disable the workflow and cancel every
+#    non-terminal run, and confirm none is left, BEFORE step 2. Disabling
+#    merge.yml makes the audit raise an R3 workflow-state FLAG: expected here.
 gh variable set AUTO_MERGE_ENABLED --repo acardote/fleet-pilot --body false
+gh workflow disable merge.yml --repo acardote/fleet-pilot
+# Cancel every non-terminal run (a run held by the concurrency group is `pending`), and
+# repeat until every count reads 0: a held run can be promoted after another is cancelled.
+while :; do
+  left=0
+  for s in in_progress queued pending waiting requested; do
+    if ! out=$(gh run list --repo acardote/fleet-pilot --workflow merge.yml --status "$s" --json databaseId --jq '.[].databaseId'); then
+      echo "gh run list failed for $s; retrying"; left=1; continue   # never treat an error as "none left"
+    fi
+    while read -r id; do
+      [ -n "$id" ] || continue
+      gh run cancel "$id" --repo acardote/fleet-pilot || true
+      left=1
+    done <<EOF_IDS
+$out
+EOF_IDS
+  done
+  [ "$left" = 0 ] && break
+  sleep 5
+done
+echo "merge.yml: no non-terminal runs left"
 # 2. Disable the ruleset (keeps its definition and id).
 gh api -X PUT repos/acardote/fleet-pilot/rulesets/$ID -f enforcement=disabled
 # 3. Merge the fix PR yourself.
 # 4. Re-enable, then re-verify as in section 4.
 gh api -X PUT repos/acardote/fleet-pilot/rulesets/$ID -f enforcement=active
 gh api repos/acardote/fleet-pilot/rulesets/$ID --jq .enforcement   # expect: "active"
-# 5. Re-run the section 3 pre-flight, then set AUTO_MERGE_ENABLED back to true.
+# 5. Re-run the section 3 pre-flight, re-enable the workflow, then set AUTO_MERGE_ENABLED back to true.
+gh workflow enable merge.yml --repo acardote/fleet-pilot
 ```
 
 Full rollback (remove the ruleset entirely; re-apply with section 4):
