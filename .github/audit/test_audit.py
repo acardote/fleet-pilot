@@ -254,12 +254,21 @@ def test_trusted_run_without_proof_is_flagged(log, why):
     assert why in a.findings[0]["summary"]
 
 
-def test_failed_merge_run_does_not_prove_even_with_markers():
+def test_failed_merge_run_with_its_own_markers_proves_the_merge():
+    """verify V-I3: fleet-pilot#3 exits 1 when ANOTHER candidate errored or was refused,
+    after merging and logging this one. Its MERGED line still proves this merge."""
     run = merge_run(conclusion="failure")
     a = auditor(world(**{f"repos/{REPO}/actions/workflows/merge.yml/runs": {"workflow_runs": [run]}}))
     a.audit_commits(None, M1)
-    assert rules_of(a) == ["R1:provenance"] and "conclusion 'failure'" in a.findings[0]["summary"]
-    assert f"repos/{REPO}/actions/runs/100/logs" not in a.gh.calls
+    assert a.findings == [] and "verified by run 100" in a.ledger[0]
+
+
+def test_failed_merge_run_without_markers_is_still_flagged():
+    run = merge_run(conclusion="failure")
+    a = auditor(world(**{f"repos/{REPO}/actions/workflows/merge.yml/runs": {"workflow_runs": [run]},
+                         f"repos/{REPO}/actions/runs/100/logs": logzip("merge refused: pr=5")}))
+    a.audit_commits(None, M1)
+    assert rules_of(a) == ["R1:provenance"]
 
 
 def test_run_created_after_merge_does_not_count():
@@ -696,20 +705,24 @@ def run_rec(rid, path=".github/workflows/ci.yml", branch="ws/a/x", event="push",
     (run_rec(1, path=".github/workflows/evil.yml"), {".github/workflows/evil.yml": "8" * 40}, True),
     (run_rec(1, branch="v1", event="push"), {".github/workflows/ci.yml": "8" * 40}, True),   # tag push
     (run_rec(1), dict(WF_BLOBS), False),                                        # same definition as main
-    (run_rec(1, branch="main", event="push"), {}, False),                       # main's own definition
+    (run_rec(1, branch="main", event="push"), {}, False),                       # main's own commit
+    (run_rec(1, branch="main", event="push", sha=OTHER), {}, True),             # a tag named main
     (run_rec(1, event="pull_request_target"), {}, False),
     (run_rec(1, path="dynamic/pages/pages-build-deployment"), {}, False),
 ])
 def test_workflow_runs_from_outside_the_default_branch(run, branch_blobs, flagged):
     r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": [run]},
                  f"repos/{REPO}/git/trees/{D1}": tree({**WF_BLOBS, **branch_blobs})})
+    r[f"repos/{REPO}/compare/{D1}...main"] = {"status": "ahead"}          # D1 is on main
+    r[f"repos/{REPO}/compare/{OTHER}...main"] = {"status": "diverged"}    # OTHER is not
     a = auditor(r)
     cur = a.foreign_runs({"id": 0, "at": "2026-11-27T11:40:00Z"})
     assert bool(a.findings) is flagged and cur["id"] == 1
 
 
 def test_run_scan_overflow_is_flagged_and_moves_on():
-    r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": Incomplete([run_rec(9, branch="main")])}})
+    r = world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": Incomplete([run_rec(9, branch="main")])},
+                 f"repos/{REPO}/compare/{D1}...main": {"status": "identical"}})
     a = auditor(r)
     assert a.foreign_runs(None)["id"] == 9 and rules_of(a) == ["R5:runs-overflow"]
 
@@ -1164,6 +1177,7 @@ def test_workflow_guard_checkout_and_pins():
     run_blocks = "\n".join(re.findall(r"run: \|\n((?:          .*\n)+)", t))
     assert "${{" not in run_lines and "${{" not in run_blocks
     assert "REBASELINE: ${{ inputs.rebaseline }}" in t       # dispatch inputs only through env
+    assert "if: github.run_attempt == '1'" in t.split("Save state for the next run", 1)[1].split("uses:", 1)[0]
     assert "name: fleet-audit-state" in t and CFG["state_artifact"] == "fleet-audit-state"
 
 
@@ -1171,3 +1185,81 @@ def test_script_stops_workflow_commands_before_printing_repo_text():
     src = (HERE / "audit.py").read_text()
     main_src = src.split("def main(", 1)[1]
     assert main_src.index("::stop-commands::") < main_src.index("run_audit(")
+
+
+# ---------------------------------------------------------------- round 2 (verify pass)
+
+def test_a_rerun_attempt_writes_nothing():
+    """verify V-I4: "Re-run all jobs" must not rewrite seq N (Tier 0 would see a fork)."""
+    state, _ = first_state()
+    with pytest.raises(au.NoOp, match="attempt 2"):
+        au.run_audit(FakeGH(second_world(state)), REPO, CFG, au.RunEnv(200, 1, WSHA, "a", "schedule", run_attempt=2), {})
+
+
+def test_a_run_older_than_the_predecessor_writes_nothing():
+    """verify V-I4: a re-run of an old run would append an entry and wedge the next run as a rollback."""
+    state, _ = first_state()
+    r = second_world(state, runs=[audit_run(200, 5)])
+    with pytest.raises(au.NoOp, match="older than"):
+        load(r, env(150, 3))
+
+
+def test_rebaseline_continue_never_adopts_state_from_other_code():
+    """verify V-I2: the forged state of an altered (then reverted) audit run is skipped."""
+    real, _ = first_state()
+    alt = "6" * 40
+    forged = copy.deepcopy(real)
+    forged["run_id"] = 260
+    forged["head"] = OTHER
+    e = dict(forged["chain"][-1], run_id=260, state=au.state_digest(forged))
+    e["digest"] = au.entry_digest(e)
+    forged["chain"][-1] = e
+    r = second_world(real, runs=[audit_run(260, 2, head=alt), audit_run(200, 1)],
+                     **{f"repos/{REPO}/git/trees/{alt}": tree({**CODE, ".github/audit/audit.py": "0" * 40}),
+                        f"repos/{REPO}/actions/runs/260/artifacts": {"artifacts": [{"id": 6, "name": "fleet-audit-state"}]},
+                        f"repos/{REPO}/actions/artifacts/6/zip": state_zip(forged)})
+    st, run, skipped = au.newest_readable_state(FakeGH(r), REPO, CFG, env(300, 3))
+    assert run["id"] == 200 and st["head"] == real["head"] and "ran audit code" in skipped[0]
+    s2, plan, a, issue = au.run_audit(FakeGH(r), REPO, CFG, env(300, 3, event="workflow_dispatch", rebaseline="continue"),
+                                      {}, now=NOW, sleep=lambda s: None)
+    assert s2["chain"][-1]["rebaseline"]["adopted_run"] == 200 and "ran audit code" in s2["chain"][-1]["rebaseline"]["skipped"][0]
+
+
+WITNESS_VECTOR = "fleet-audit-chain seq=7 digest=" + "ab" * 32 + " run_id=99 flags_total=2"
+
+
+def test_witness_line_vector_matches_the_front_door():
+    """PAU tests/test_fleet_audit_check.py parses the same line."""
+    assert au.witness_line({"seq": 7, "digest": "ab" * 32, "run_id": 99, "flags_total": 2}) == WITNESS_VECTOR
+
+
+def test_main_emits_exactly_one_witness_after_resuming_commands(monkeypatch, tmp_path, capsys):
+    state, _ = first_state()
+    fake = FakeGH(second_world(state))
+    monkeypatch.setattr(au, "GitHub", lambda *a, **k: fake)
+    for k, v in dict(GH_TOKEN="t", GITHUB_RUN_ID="300", GITHUB_RUN_NUMBER="2", GITHUB_WORKFLOW_SHA=WSHA,
+                     GITHUB_EVENT_NAME="schedule", GITHUB_ACTOR="acardote", VARS_JSON="{}", GITHUB_RUN_ATTEMPT="1").items():
+        monkeypatch.setenv(k, v)
+    assert au.main(["--repo", REPO, "--config", str(HERE / "config.json"), "--state-out", str(tmp_path / "s.json")]) == 0
+    out = capsys.readouterr().out.splitlines()
+    notes = [x for x in out if x.startswith("::notice title=fleet-audit-chain::")]
+    saved = json.loads((tmp_path / "s.json").read_text())
+    assert notes == ["::notice title=fleet-audit-chain::" + au.witness_line(saved["chain"][-1])]
+    resume = next(i for i, x in enumerate(out) if re.fullmatch(r"::[0-9a-f]{32}::", x))
+    assert out.index(notes[0]) > resume
+
+
+def test_main_rerun_attempt_exits_zero_without_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(au, "GitHub", lambda *a, **k: FakeGH(world()))
+    for k, v in dict(GH_TOKEN="t", GITHUB_RUN_ID="300", GITHUB_RUN_NUMBER="2", GITHUB_RUN_ATTEMPT="2").items():
+        monkeypatch.setenv(k, v)
+    assert au.main(["--repo", REPO, "--config", str(HERE / "config.json"), "--state-out", str(tmp_path / "s.json")]) == 0
+    assert not (tmp_path / "s.json").exists()
+
+
+def test_issue_recreated_late_is_found_newest_first():
+    fake = FakeGH(world(**{f"repos/{REPO}/issues?state=all&sort=created&direction=asc": [{"number": 1, "title": "x"}],
+                           f"repos/{REPO}/issues?state=all&sort=created&direction=desc": [
+                               {"number": 900, "title": CFG["findings_issue_title"], "user": {"login": "github-actions[bot]"},
+                                "body": "b"}]}))
+    assert au.find_issue(fake, REPO, CFG) == (900, "b")

@@ -35,7 +35,11 @@
 #   chain continues (design R6).
 #
 # Never delete runs or artifacts of this workflow: the audit reads that as
-# tampering and stops.
+# tampering and stops. Re-running an attempt is harmless: it writes nothing.
+#
+# Each successful run also emits one `fleet-audit-chain` notice annotation
+# (seq, digest, run id, FLAG count). Annotations are bound to the run and the
+# front door reads them anonymously as the witness the anchor must match.
 #
 # Changing this file is a 7a change: the operator merges.
 name: merge-audit
@@ -116,6 +120,9 @@ jobs:
         run: python3 .github/audit/audit.py --repo "${GITHUB_REPOSITORY}" --config .github/audit/config.json --state-out "${STATE_DIR}/state.json"
 
       - name: Save state for the next run
+        # A re-run attempt writes nothing (audit.py exits 0 without state): the
+        # chain entry and the witness belong to attempt 1.
+        if: github.run_attempt == '1'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fleet-audit-state

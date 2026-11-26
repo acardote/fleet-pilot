@@ -36,8 +36,10 @@ Rules:
       merge by the bot merger (`merged_by`, from the PR endpoint) needs a
       `merge.yml` run that is TRUSTED by API metadata alone (path, this repo,
       event `schedule` on the default branch or `pull_request_target` whose PR
-      base is the default branch), concluded `success`, and logged as whole
-      lines, outside `##[group]Run` script echoes:
+      base is the default branch), completed (any conclusion: merge.yml exits
+      1 when ANOTHER candidate errored or was refused, after it already merged
+      and logged this one; it prints MERGED only after GitHub confirmed the
+      merge), and logged as whole lines, outside `##[group]Run` script echoes:
         VERDICT-RECOMPUTED pr=<n> head=<H> result=pass
         MERGED pr=<n> head=<H> run_id=<run id> workflow_ref=<repo>/<merge.yml>@refs/heads/<default>
       A merge by the operator login is a FLAG to confirm (separately worded
@@ -117,6 +119,7 @@ DEFAULT_DEFINED_EVENTS = {"schedule", "pull_request_target", "issue_comment", "i
                           "registry_package"}
 RETRY_STATUS = {500, 502, 503, 504}
 CODE_PATHS = (".github/workflows/audit.yml", ".github/audit/audit.py", ".github/audit/config.json")
+WITNESS_TITLE = "fleet-audit-chain"
 ANCHOR_BEGIN = "<!-- fleet-audit-chain v1 -->"
 ANCHOR_END = "<!-- /fleet-audit-chain -->"
 ANCHOR_BUDGET = 50000          # chars of chain entries kept in the issue body (limit 65536)
@@ -134,6 +137,11 @@ class AuditError(Exception):
 
 class NotFound(AuditError):
     pass
+
+
+class NoOp(Exception):
+    """This run must not write state or the anchor (a re-run attempt, or a run
+    older than the predecessor). Exit 0 without changing anything."""
 
 
 class StateBroken(AuditError):
@@ -161,6 +169,12 @@ def h(obj: Any) -> str:
 
 def entry_digest(entry: dict) -> str:
     return h({k: v for k, v in entry.items() if k != "digest"})
+
+
+def witness_line(entry: dict) -> str:
+    """Kept identical to PAU fleet_audit_check.WITNESS_RE (a vector is pinned on both sides)."""
+    return (f"fleet-audit-chain seq={entry['seq']} digest={entry['digest']} run_id={entry['run_id']} "
+            f"flags_total={entry.get('flags_total') or 0}")
 
 
 def state_digest(state: dict) -> str:
@@ -682,9 +696,9 @@ class Auditor:
                 else:
                     seen.append(f"run {rid}: still {run.get('status')!r} after {self.cfg['max_pending_minutes']} min")
                 continue
-            if run.get("conclusion") != "success":
-                seen.append(f"run {rid}: conclusion {run.get('conclusion')!r}")
-                continue
+            # Any conclusion counts (fleet-pilot#3: the run fails when another
+            # candidate errored or was refused, after merging and logging this
+            # one); the trust is the run's metadata plus its own log lines.
             try:
                 z = self.gh.download(f"repos/{self.repo}/actions/runs/{rid}/logs", int(self.cfg["max_log_bytes"]))
             except NotFound:
@@ -698,7 +712,7 @@ class Auditor:
             return "pending"
         detail = "; ".join(seen[:8]) or "no merge.yml run in the window"
         self.flag("R1", f"R1:provenance:{sha}",
-                  f"{sha[:12]} PR #{n} merged by {self.cfg['bot_merger']} at head {head[:12]} with no successful "
+                  f"{sha[:12]} PR #{n} merged by {self.cfg['bot_merger']} at head {head[:12]} with no completed "
                   f"default-branch merge.yml run that logged its inline recomputation and the merge ({detail})")
         return "FLAG (no provenance)"
 
@@ -1006,6 +1020,7 @@ class Auditor:
                       f"ones in that window were not checked (a run flood)")
         default_blobs: dict | None = None
         trees: dict[str, dict] = {}
+        on_main: dict[str, bool] = {}
         new = sorted((x for x in runs if int(x.get("id") or 0) > last_id), key=lambda x: int(x["id"]))
         for run in new:
             path = run.get("path") or ""
@@ -1013,11 +1028,26 @@ class Auditor:
                 continue        # dynamic workflows (Pages, Dependabot): GitHub-defined
             path = path.split("@", 1)[0]
             event = run.get("event")
-            if run.get("head_branch") == self.default and event != "pull_request":
-                continue
             if event in DEFAULT_DEFINED_EVENTS:
                 continue
             sha = run.get("head_sha") or ""
+            if run.get("head_branch") == self.default and event != "pull_request":
+                # A tag (or other ref) named like the default branch reports the
+                # same head_branch: the commit must be on the default branch.
+                if sha not in on_main:
+                    try:
+                        st = self.gh.get(f"repos/{r}/compare/{sha}...{urllib.parse.quote(self.default)}").get("status") \
+                            if SHA_RE.match(sha) else None
+                    except NotFound:
+                        st = None
+                    on_main[sha] = st in ("ahead", "identical")
+                if on_main[sha]:
+                    continue
+                self.flag("R5", f"R5:run:{run.get('id')}",
+                          f"workflow run {run.get('id')} ({path}, event {event!r}) reports ref {self.default!r} but its "
+                          f"commit {sha[:12]} is not on the default branch (a tag or other ref named "
+                          f"{self.default!r}): it ran a definition the default branch does not hold")
+                continue
             if default_blobs is None:
                 default_blobs = blobs_at(self.gh, r, self.default)
             if sha not in trees:
@@ -1076,8 +1106,10 @@ class Auditor:
 
 class RunEnv:
     def __init__(self, run_id: int, run_number: int | None = None, workflow_sha: str = "", actor: str = "",
-                 event: str = "", rebaseline: str = "", reason: str = "", server: str = "https://github.com"):
+                 event: str = "", rebaseline: str = "", reason: str = "", server: str = "https://github.com",
+                 run_attempt: int = 1):
         self.run_id = run_id
+        self.run_attempt = run_attempt
         self.run_number = run_number
         self.workflow_sha = workflow_sha
         self.actor = actor
@@ -1136,8 +1168,11 @@ def find_issue(gh: GitHub, repo: str, cfg: dict) -> tuple[int | None, str | None
 
     # Oldest first, so the issue the first audit run created stays on page 1
     # (no reliance on the `creator` filter accepting a bot login).
-    q = urllib.parse.urlencode({"state": "all", "sort": "created", "direction": "asc"})
-    gh.collect(f"repos/{repo}/issues?{q}", max_pages=3, stop=match)
+    for direction in ("asc", "desc"):     # desc: an issue re-created after the repo's 300th item
+        q = urllib.parse.urlencode({"state": "all", "sort": "created", "direction": direction})
+        gh.collect(f"repos/{repo}/issues?{q}", max_pages=3, stop=match)
+        if found:
+            break
     if found:
         return found[0]["number"], found[0].get("body") or ""
     return None, None
@@ -1199,6 +1234,9 @@ def load_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv, anchor: dict | Non
                               f"{entries[-1].get('seq')}: audit runs were deleted")
         return None
     pred = runs[0]
+    if env.run_number and pred.get("run_number") and int(pred["run_number"]) >= int(env.run_number):
+        raise NoOp(f"this is run #{env.run_number}, older than the newest successful audit run "
+                   f"#{pred['run_number']} (a re-run of an old run): nothing written")
     # run_number continuity: a deleted audit run leaves a permanent gap
     if env.run_number and pred.get("run_number"):
         wf = cfg["audit_workflow"].rsplit("/", 1)[-1]
@@ -1269,15 +1307,30 @@ def load_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv, anchor: dict | Non
     return state
 
 
-def newest_readable_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv) -> dict | None:
+def newest_readable_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv) -> tuple[dict | None, dict | None, list[str]]:
+    """For rebaseline=continue: the newest state that verifies against its own
+    chain entry AND was written by this run's audit code (or code listed in
+    accepted_previous_code). Returns (state, run, skipped reasons). A state
+    forged by altered audit code is never adopted."""
+    skipped: list[str] = []
+    cur = code_digest(gh, repo, env.workflow_sha) if env.workflow_sha else None
     for run in trusted_audit_runs(gh, repo, cfg, env)[:30]:
         try:
             st = read_state_artifact(gh, repo, cfg, run)
-        except StateBroken:
+            if st is None:
+                skipped.append(f"run {run['id']}: no state artifact")
+                continue
+            verify_state(st, run)
+        except StateBroken as e:
+            skipped.append(f"run {run['id']}: {e}")
             continue
-        if st is not None:
-            return st
-    return None
+        if cur is not None:
+            code = cur if run.get("head_sha") == env.workflow_sha else code_digest(gh, repo, run.get("head_sha") or "")
+            if code != cur and code not in (cfg.get("accepted_previous_code") or []):
+                skipped.append(f"run {run['id']}: ran audit code {code[:12]}, not this code {cur[:12]}")
+                continue
+        return st, run, skipped
+    return None, None, skipped
 
 
 def chunks(text: str, size: int = COMMENT_CHUNK) -> list[str]:
@@ -1326,6 +1379,9 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
               hmac_key: str = "") -> tuple[dict, dict, "Auditor", int | None]:
     """Returns (state, plan, auditor, issue_number). The caller posts the plan
     (comments + anchor) and writes the state file. Raises StateBroken / AuditError."""
+    if env.run_attempt > 1:
+        raise NoOp(f"attempt {env.run_attempt} of run {env.run_id}: a re-run never rewrites the chain entry the first "
+                   f"attempt wrote (the front door reads attempt 1's witness); nothing written")
     meta = gh.get(f"repos/{repo}")
     if meta.get("default_branch") != cfg["default_branch"]:
         raise AuditError(f"default branch is {meta.get('default_branch')!r}, config says {cfg['default_branch']!r}")
@@ -1345,11 +1401,18 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
             raise
         state, problem = None, str(e)
     if env.rebaseline:
+        adopted = None
+        skipped: list[str] = []
         if env.rebaseline == "continue" and state is None:
-            state = newest_readable_state(gh, repo, cfg, env)
-        rebaseline = {"mode": env.rebaseline, "actor": env.actor, "reason": env.reason, "problem": clean(problem, 300)}
+            state, run, skipped = newest_readable_state(gh, repo, cfg, env)
+            adopted = run.get("id") if run else None
+        elif state is not None:
+            adopted = state.get("run_id")
+        rebaseline = {"mode": env.rebaseline, "actor": env.actor, "reason": env.reason, "problem": clean(problem, 300),
+                      "adopted_run": adopted, "skipped": [clean(x, 160) for x in skipped[:10]]}
         a.flag("R6", f"R6:rebaseline:{env.run_id}",
-               f"re-baselined ({env.rebaseline}) by {env.actor!r}, reason {env.reason!r}; state problem: {problem or 'none'}"
+               f"re-baselined ({env.rebaseline}) by {env.actor!r}, reason {env.reason!r}; adopted the state of run "
+               f"{rebaseline['adopted_run']}; skipped: {'; '.join(rebaseline['skipped']) or 'none'}; state problem: {problem or 'none'}"
                f"{'' if state else '; no previous state used: commits since the baseline are re-audited, and changes before this run are unseen'}")
     prev = state or {}
     if state and state.get("issue") and issue is not None and state["issue"] != issue:
@@ -1447,7 +1510,8 @@ def main(argv: list[str] | None = None) -> int:
     env = RunEnv(int(run_id), int(rn) if rn.isdigit() else None, os.environ.get("GITHUB_WORKFLOW_SHA", ""),
                  os.environ.get("GITHUB_ACTOR", ""), os.environ.get("GITHUB_EVENT_NAME", ""),
                  os.environ.get("REBASELINE", ""), os.environ.get("REBASELINE_REASON", ""),
-                 os.environ.get("GITHUB_SERVER_URL", "https://github.com"))
+                 os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
+                 int(os.environ.get("GITHUB_RUN_ATTEMPT", "1") or 1))
     gh = None
     try:
         with open(args.config, encoding="utf-8") as fh:
@@ -1471,12 +1535,28 @@ def main(argv: list[str] | None = None) -> int:
             with open(summary, "a", encoding="utf-8") as fh:
                 fh.write(text + "\n")
         print(f"::{stop_token}::", flush=True)
-        for f in new[:50]:   # annotations make FLAGs visible on the (green) run page
+        # The WITNESS: an annotation is bound to this run and readable
+        # anonymously; the admin can remove it only by deleting the run (a
+        # run_number hole). The front door requires the anchor to hold exactly
+        # this entry, so an anchor rewritten to strip FLAGs is detected.
+        head = state["chain"][-1]
+        print(f"::notice title={WITNESS_TITLE}::{witness_line(head)}", flush=True)
+        for f in new[:9]:    # 10 warnings per step; FLAGs readable on the run page and by the front door
             print(f"::warning title=FLAG {f['rule']}::{f['summary'].replace('::', ': :')[:300]}")
+    except NoOp as e:
+        print(f"merge-audit: {e}")
+        return 0
     except StateBroken as e:
         print(f"merge-audit: FAIL (fail closed): state broken: {e}")
-        print("merge-audit: after investigating, dispatch audit.yml with rebaseline=continue (keep the newest "
-              "readable state) or rebaseline=fresh; the front door alerts on the chain discontinuity either way")
+        try:
+            cand, run, skipped = newest_readable_state(gh, args.repo, cfg, env) if gh is not None else (None, None, [])
+            would = (f"run {run['id']} (#{run.get('run_number')}, seq {cand['chain'][-1]['seq']}, head "
+                     f"{str(cand.get('head'))[:12]})") if cand else "nothing (fresh)"
+            print(f"merge-audit: rebaseline=continue would adopt {would}; skipped: {'; '.join(skipped) or 'none'}")
+        except Exception as e3:  # noqa: BLE001
+            print(f"merge-audit: could not compute the rebaseline candidate: {type(e3).__name__}: {e3}")
+        print("merge-audit: investigate first; then dispatch audit.yml with rebaseline=continue or rebaseline=fresh. "
+              "The front door alerts on any rebaseline.")
         try:
             if gh is not None and not args.dry_run:
                 mark_broken(gh, args.repo, getattr(e, "issue", None), getattr(e, "anchor", None), str(e))
