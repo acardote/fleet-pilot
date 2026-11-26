@@ -34,9 +34,13 @@ and rollback DETECTABLE and fails closed:
 Rules:
   R1  merge provenance. Every first-parent default-branch commit that is a PR
       merge by the bot merger (`merged_by`, from the PR endpoint) needs a
-      `merge.yml` run that is TRUSTED by API metadata alone (path, this repo,
-      event `schedule` on the default branch or `pull_request_target` whose PR
-      base is the default branch), completed (any conclusion: merge.yml exits
+      `merge.yml` run (path, this repo, event `schedule` on the default branch
+      or `pull_request_target`) whose log archive carries the Actions service's
+      own `Job defined at: <repo>/.github/workflows/merge.yml@refs/heads/<default>`
+      line in `<job>/system.txt` (no step can write that file, and run
+      metadata cannot tell which base a pull_request_target run used: its
+      `pull_requests[]` lists open PRs with that head, empty once they close),
+      completed (any conclusion: merge.yml exits
       1 when ANOTHER candidate errored or was refused, after it already merged
       and logged this one; it prints MERGED only after GitHub confirmed the
       merge), and logged as whole lines, outside `##[group]Run` script echoes:
@@ -84,6 +88,7 @@ sees no recent successful run).
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -375,20 +380,63 @@ class GitHub:
 # --------------------------------------------------------------------------
 
 def pr_target_untrusted(run: dict, default: str) -> str | None:
+    """Metadata pre-filter for a pull_request_target run. Metadata cannot prove
+    which base (so which definition) a pull_request_target run used:
+    `pull_requests[]` lists open PRs whose head matches, not the PR that
+    triggered the run, and it is EMPTY once those PRs are closed (confirmed live:
+    merge.yml run 45892436548). A sibling PR with the same head and another
+    base would look identical. So the definition is proven from the run's log
+    instead (`log_definition_ok`: the service-written `Job defined at:` line in
+    `<job>/system.txt`). Here only a listed PR on another base is refused."""
     prs = run.get("pull_requests") or []
-    if not prs:
-        return "pull_request_target with no PR (fork or unknown base)"
     if any((p.get("base") or {}).get("ref") != default for p in prs):
         return "pull_request_target on a PR not based on the default branch"
     return None
 
 
+DEFINED_AT_RE = re.compile(r"^Job defined at: (\S+)$")
+
+
+def log_definition_ok(zbytes: bytes, expected: str, max_unzipped: int) -> tuple[bool, str]:
+    """The workflow definition a run executed, as the Actions service records it:
+    `Job defined at: <repo>/<path>@<ref>` in each job's `system.txt`. That file
+    is written by the service, not by any step (step logs are `N_<name>.txt`),
+    so a workflow cannot forge it. Every job must name `expected`, and at least
+    one must exist; anything else fails closed."""
+    seen: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(zbytes)) as z:
+            infos = [i for i in z.infolist() if not i.is_dir()]
+            if sum(i.file_size for i in infos) > max_unzipped:
+                return False, "log archive too large to read (fail closed)"
+            for info in infos:
+                if info.filename.rsplit("/", 1)[-1] != "system.txt":
+                    continue
+                for raw in z.read(info).decode("utf-8", "replace").splitlines():
+                    m = LOG_LINE_RE.match(raw)
+                    d = DEFINED_AT_RE.match(m.group(1).rstrip("\r")) if m else None
+                    if d:
+                        seen.append(d.group(1))
+    except zipfile.BadZipFile:
+        return False, "log archive unreadable"
+    if not seen:
+        return False, "no service-written 'Job defined at' line (definition unproven)"
+    bad = sorted({x for x in seen if x != expected})
+    if bad:
+        return False, f"defined at {bad[0]!r}, not {expected!r}"
+    return True, ""
+
+
 def merge_run_untrusted(run: dict, repo: str, default: str, merge_path: str) -> str | None:
-    """None when the run's definition provably came from the default branch."""
+    """Metadata pre-filter (path, repository, default-branch events). It cannot
+    prove the definition of a pull_request_target run; verify_bot_merge then
+    requires the service-written definition line (`log_definition_ok`)."""
     if run.get("path") != merge_path:
         return f"path {run.get('path')!r}"
     if (run.get("repository") or {}).get("full_name") != repo:
         return "another repository"
+    if (run.get("head_repository") or {}).get("full_name") != repo:
+        return f"head repository {((run.get('head_repository') or {}).get('full_name'))!r} is not this repository (fork)"
     event = run.get("event")
     if event == "schedule":
         if run.get("head_branch") != default:
@@ -500,6 +548,9 @@ class Auditor:
         self.notes: list[str] = []
         self._slept = False
         self.backlogs: dict[str, dict] = {}
+        self._defined: dict = {}         # run id -> (definition proven, why)
+        self._on_main_cache: dict = {}
+        self._siblings: dict = {}
 
     def flag(self, rule: str, key: str, summary: str) -> None:
         self.findings.append(finding(rule, key, summary))
@@ -510,7 +561,7 @@ class Auditor:
     def _on_main(self, sha: str) -> bool:
         """The commit is on the default branch (ref type branch, not a tag or
         other ref that only shares the name)."""
-        cache = self.__dict__.setdefault("_on_main_cache", {})
+        cache = self._on_main_cache
         if sha not in cache:
             try:
                 st = self.gh.get(f"repos/{self.repo}/compare/{sha}...{urllib.parse.quote(self.default)}").get("status") \
@@ -537,6 +588,23 @@ class Auditor:
         later = self.SECTIONS[self.SECTIONS.index(section) + 1:]
         reserved = sum(int(shares.get(x, 0)) for x in later)
         self.section_limit = max(self.gh.count + int(shares.get(section, 0)), total - reserved)
+
+    def sibling_base(self, branch: str | None) -> str | None:
+        """Extra guard for a pull_request_target run (the definition proof is the
+        main one): any PR, open or closed, from the same head branch whose base
+        is not the default branch could have triggered it with that base's
+        definition. An incomplete listing fails closed."""
+        if not branch:
+            return "no head branch"
+        if branch not in self._siblings:
+            owner = self.repo.split("/", 1)[0]
+            q = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "all"})
+            prs, complete = self.gh.collect(f"repos/{self.repo}/pulls?{q}", max_pages=3)
+            other = sorted({(p.get("base") or {}).get("ref") for p in prs} - {self.default})
+            self._siblings[branch] = (f"a PR from head {branch!r} is based on {other[0]!r}, not {self.default}"
+                                      if other else None) if complete else \
+                f"more than 300 PRs from head {branch!r}: their bases could not all be read"
+        return self._siblings[branch]
 
     def over_budget(self) -> bool:
         """This section's API budget (shared GITHUB_TOKEN quota) or the time budget is spent."""
@@ -747,6 +815,8 @@ class Auditor:
         for run in sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True):
             rid = run.get("id")
             why = merge_run_untrusted(run, self.repo, self.default, mpath)
+            if not why and run.get("event") == "pull_request_target":
+                why = self.sibling_base(run.get("head_branch"))
             if why:
                 seen.append(f"run {rid} untrusted: {why}")
                 continue
@@ -770,6 +840,12 @@ class Auditor:
             except NotFound:
                 seen.append(f"run {rid}: logs unavailable")
                 continue
+            dok, dwhy = log_definition_ok(z, expected_ref, 4 * int(self.cfg["max_log_bytes"]))
+            if not dok:
+                seen.append(f"run {rid}: {dwhy}")
+                continue
+            # A MERGED line from a run proven to run main's merge.yml counts for the
+            # PR it names, whichever PR or schedule triggered the run.
             ok, why = log_proves_merge(z, n, head, int(rid), expected_ref, 4 * int(self.cfg["max_log_bytes"]))
             if ok:
                 return f"verified by run {rid}"
@@ -860,6 +936,19 @@ class Auditor:
         snap = {"rulesets": rulesets, "rules": h(rules),
                 "protection": {"protected": branch.get("protected"), "protection": h(branch.get("protection"))},
                 "workflows": wfs, "labels": labels, "vars": self._vars(vars_ctx)}
+        # The definition proof (system.txt `Job defined at:`) assumes merge.yml and
+        # verdict.yml cannot be called from another workflow: a caller defined
+        # elsewhere would run main's job under main's name.
+        for wf in (self.cfg["merge_workflow"], self.cfg["verdict_workflow"]):
+            try:
+                meta = self.gh.get(f"repos/{r}/contents/{urllib.parse.quote(wf)}?ref={urllib.parse.quote(d)}")
+                text = base64.b64decode(meta.get("content") or "").decode("utf-8", "replace")
+            except (NotFound, ValueError):
+                continue
+            if re.search(r"(?m)^[^#\n]*\bworkflow_call\b", text):
+                self.condition("R3", f"R3:workflow-call:{wf}",
+                               f"{wf} on {d} declares a workflow_call trigger: another workflow could call it, and the "
+                               f"audit's definition proof assumes it cannot")
         exp = self.cfg.get("expected_ruleset")
         if exp and not any(v["name"] == exp and v["enforcement"] == "active" for v in rulesets.values()):
             now_sets = ", ".join("{}={}".format(v["name"], v["enforcement"]) for v in rulesets.values()) or "none"
@@ -1074,15 +1163,16 @@ class Auditor:
             read += 1
             for cr in self.gh.collect(f"repos/{r}/commits/{head}/check-runs?{q}", key="check_runs", max_pages=3)[0]:
                 cid = cr.get("id")
-                if cr.get("status") != "completed" or cid in ok:
+                okkey = f"{cid}:{cr.get('conclusion')}"     # a later conclusion change is re-checked
+                if cr.get("status") != "completed" or okkey in ok:
                     continue
                 known = (bad or {}).get(str(cid))
-                why = (known.get("why") if isinstance(known, dict) else known) or self._check_untrusted(cr, vpath)
+                why = (known.get("why") if isinstance(known, dict) else known) or self._check_untrusted(cr, vpath, p)
                 if why:
                     new_bad[str(cid)] = {"why": why, "pr": n, "head": head}
                     self.condition("R4", f"R4:{cid}", f"{name} check run {cid} on PR #{n} {why}")
                 else:
-                    ok.add(cid)
+                    ok.add(okkey)
             seen[n] = {"head": head, "at": iso(self.now)}
         self.backlogs["checks"] = dict(prev_backlog or {"runs": 0})
         if backlog:
@@ -1090,9 +1180,26 @@ class Auditor:
         else:
             self.backlogs["checks"] = {"runs": 0}
         seen = {k: v for k, v in seen.items() if k in heads}
-        return sorted(ok)[-2000:], new_bad, seen
+        def num(k) -> int:      # trim by numeric check-run id (newest kept), not text order
+            head_ = str(k).split(":", 1)[0]
+            return int(head_) if head_.isdigit() else 0
+        return sorted((str(x) for x in ok), key=num)[-2000:], new_bad, seen
 
-    def _check_untrusted(self, cr: dict, vpath: str) -> str | None:
+    def _check_untrusted(self, cr: dict, vpath: str, pr: dict | None = None) -> str | None:
+        """A review-verdict check run is trusted only as a job of a verdict.yml
+        run whose definition the Actions service records as the default
+        branch's (`log_definition_ok`), with the check run's conclusion equal to
+        the job's. A check run created through the API becomes a runnerless
+        job of the run that created it (live: forgery 140152689638 is a job of
+        a ci.yml run), so the path check and the definition proof are what
+        stop it; do not reorder or drop them. The metadata guards (pull
+        requests on another base, same-head PRs on another base) run first for
+        every case. A runnerless job is accepted without the definition proof
+        only when it was CANCELLED (verdict.yml's concurrency group, #594; such
+        runs have empty log archives) and the check run says the same: a
+        cancelled check never satisfies a required status check. A runnerless
+        `skipped` or `neutral` job would satisfy one (GitHub counts them as
+        passing), so it is flagged (fp14 N1)."""
         r = self.repo
         app = (cr.get("app") or {}).get("id")
         if app != int(self.cfg["actions_app_id"]):
@@ -1101,21 +1208,49 @@ class Auditor:
             job = self.gh.get(f"repos/{r}/actions/jobs/{cr.get('id')}")
         except NotFound:
             return "is not an Actions job (forged)"
-        if job.get("runner_name") is None or not job.get("steps"):
-            return (f"was created through the API (runner_name={job.get('runner_name')!r}, "
-                    f"steps={len(job.get('steps') or [])})")
+        if cr.get("conclusion") != job.get("conclusion"):
+            return (f"says {cr.get('conclusion')!r} but its job concluded {job.get('conclusion')!r} "
+                    f"(the check run was rewritten)")
         try:
             run = self.gh.get(f"repos/{r}/actions/runs/{job.get('run_id')}")
         except NotFound:
             return f"belongs to run {job.get('run_id')}, which does not exist"
         if run.get("path") != vpath:
-            return f"is a job of {run.get('path')!r}, not {vpath} (a same-named job in another workflow)"
+            return f"is a job of {run.get('path')!r}, not {vpath} (a same-named job in another workflow, or created through the API)"
         if (run.get("repository") or {}).get("full_name") != r:
             return "is a job of a run in another repository"
+        if (run.get("head_repository") or {}).get("full_name") != r:
+            return "is a job of a run whose head repository is not this repository (fork)"
         if run.get("event") != "pull_request_target":
             return f"is a job of a {vpath} run on event {run.get('event')!r} (definition not from the default branch)"
-        why = pr_target_untrusted(run, self.default)
-        return f"is a job of an untrusted {vpath} run ({why})" if why else None
+        # Metadata guards first, for every case (fp14 N1).
+        why = pr_target_untrusted(run, self.default) or self.sibling_base(run.get("head_branch"))
+        if why:
+            return f"is a job of an untrusted {vpath} run ({why})"
+        no_runner = not job.get("runner_name") or not job.get("steps")
+        if no_runner and job.get("conclusion") == "cancelled":
+            # verdict.yml's concurrency group cancels jobs before they get a runner,
+            # and their run's log archive is empty (live: run 45890692632), so no
+            # definition proof exists. Accepted only because a cancelled check
+            # never satisfies a required status check. `skipped` and `neutral`
+            # do (GitHub counts them as passing), so they fall through to the
+            # definition proof like any other job.
+            return None
+        cache = self._defined
+        rid = run.get("id")
+        if rid not in cache:
+            try:
+                z = self.gh.download(f"repos/{r}/actions/runs/{rid}/logs", int(self.cfg["max_log_bytes"]))
+                cache[rid] = log_definition_ok(z, f"{r}/{vpath}@refs/heads/{self.default}", 4 * int(self.cfg["max_log_bytes"]))
+            except NotFound:
+                cache[rid] = (False, "its run's logs are unavailable (definition unproven)")
+        dok, dwhy = cache[rid]
+        if not dok:
+            return f"is a job of a {vpath} run whose definition is not proven to be the default branch's ({dwhy})"
+        if no_runner:
+            return (f"was created through the API (runner_name={job.get('runner_name')!r}, "
+                    f"steps={len(job.get('steps') or [])}, conclusion {job.get('conclusion')!r})")
+        return None
 
     # ---- R5: workflows run from outside the default branch
     def foreign_runs(self, cursor: dict | None, prev_backlog: dict | None = None) -> dict:
