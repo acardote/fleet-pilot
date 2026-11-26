@@ -1,0 +1,50 @@
+{
+  "_comment": "Read by verdict.py from the default branch only. Changing this file is a 7a change (operator merges). Design: acardote/personal-assistant-ultra docs/design/merge-model.md section 2 and 3 step 4; child issue acardote/personal-assistant-ultra#579.",
+  "trusted_record_authors": ["acardote-fleet[bot]", "acardote"],
+  "reviewer_agents": ["pr-reviewer", "pr-challenger", "wario"],
+  "author_agents": ["yoshi", "daisy", "mario", "rosalina", "toad", "toadsworth", "peach"],
+  "weight_tiers": ["trivial", "standard", "heavy"],
+  "weight_label_prefix": "weight:",
+  "weight_thresholds": {
+    "trivial_max_loc": 49,
+    "standard_max_loc": 500,
+    "trivial_max_files": 1
+  },
+  "heavy_paths": [
+    ".github/**",
+    ".claude/**",
+    ".husky/**",
+    ".devcontainer/**",
+    ".vscode/**",
+    ".bruno/**",
+    "agents/**",
+    "CLAUDE.md",
+    ".envrc",
+    ".pre-commit-config.yaml",
+    "templates/git-hooks/**",
+    "templates/routines/**",
+    "release-policy.yaml",
+    "RELEASE.md",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "go.sum",
+    "Cargo.toml",
+    "**/requirements*.txt",
+    "**/Pipfile*",
+    "**/Gemfile*",
+    "**/*lock*",
+    "**/migrations/**",
+    "**/*.sql",
+    "**/*.tf",
+    "**/iam/**"
+  ],
+  "review_sets": {
+    "trivial": ["pr-challenger"],
+    "standard": ["pr-reviewer", "pr-challenger"],
+    "heavy": ["pr-reviewer", "pr-challenger", "wario"]
+  },
+  "required_ci_workflows": [".github/workflows/ci.yml"],
+  "max_pr_files": 3000,
+  "max_pr_commits": 250
+}
