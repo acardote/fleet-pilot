@@ -82,15 +82,22 @@ ID=$(gh api repos/acardote/fleet-pilot/rulesets --jq '.[] | select(.name=="e5-ma
 #    The variable alone is not enough: a merge.yml run reads it once at start, starts no
 #    merge call after 600 s, and a call can take up to 120 s more, so an in-flight run can
 #    merge for up to about 12 minutes. So also disable the workflow and cancel every
-#    in-progress or queued run, and confirm none is left, BEFORE step 2. Disabling
+#    non-terminal run, and confirm none is left, BEFORE step 2. Disabling
 #    merge.yml makes the audit raise an R3 workflow-state FLAG: expected here.
 gh variable set AUTO_MERGE_ENABLED --repo acardote/fleet-pilot --body false
 gh workflow disable merge.yml --repo acardote/fleet-pilot
-for s in in_progress queued; do
-  gh run list --repo acardote/fleet-pilot --workflow merge.yml --status $s --json databaseId --jq '.[].databaseId' \
-    | xargs -r -n1 gh run cancel --repo acardote/fleet-pilot
+# Cancel every non-terminal run (a run held by the concurrency group is `pending`), and
+# repeat until every count reads 0: a held run can be promoted after another is cancelled.
+while :; do
+  left=0
+  for s in in_progress queued pending waiting requested; do
+    ids=$(gh run list --repo acardote/fleet-pilot --workflow merge.yml --status $s --json databaseId --jq '.[].databaseId')
+    for id in $ids; do gh run cancel "$id" --repo acardote/fleet-pilot; left=1; done
+  done
+  [ "$left" = 0 ] && break
+  sleep 5
 done
-for s in in_progress queued; do gh run list --repo acardote/fleet-pilot --workflow merge.yml --status $s --json databaseId --jq length; done   # expect: 0 and 0
+echo "merge.yml: no non-terminal runs left"
 # 2. Disable the ruleset (keeps its definition and id).
 gh api -X PUT repos/acardote/fleet-pilot/rulesets/$ID -f enforcement=disabled
 # 3. Merge the fix PR yourself.
