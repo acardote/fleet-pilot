@@ -46,7 +46,7 @@ HEAD_REF = "ws/feature"
 
 @pytest.fixture(scope="module")
 def wf():
-    yaml = pytest.importorskip("yaml")
+    import yaml  # required, never skipped: ci.yml installs PyYAML (fleet-pilot#3 review, I4)
     doc = yaml.safe_load(WORKFLOW.read_text())
     # PyYAML (YAML 1.1) reads the bare key `on` as boolean True.
     if True in doc and "on" not in doc:
