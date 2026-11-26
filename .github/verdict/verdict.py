@@ -50,10 +50,27 @@ Every other author is ignored, whatever it says. Lines inside fenced code,
 HTML comments, block quotes or indented lines are never records. In a
 trusted comment, any line that looks like a CRITICAL but is not a live,
 well-formed record fails the verdict closed ("unparseable critical"), unless
-it is a quote of a live CRITICAL with the same id and SHA. A trusted comment
-that carries record-like text and was edited after posting fails closed.
-Deleted comments cannot be detected by a stateless check; that is an audit
-job. No check run or commit status is read.
+it is a quote of a live CRITICAL with the same id and SHA. "Looks like a
+CRITICAL" means either: the line names critical plus an id=/reviewer=/sha=
+field, or the line's first word, after stripping markdown markup (headings,
+bullets, numbering, bold/italic, code ticks), is `critical` in any case
+("CRITICAL - auth bypass", "Critical: id: x ..."). The only exemption is a
+line that states zero criticals ("## Critical (0)", "Critical: none"). Prose
+whose first word is not critical ("No critical findings") is not affected.
+
+Edits. A trusted comment that carries record-like text and was edited after
+posting fails closed. Any edit (updated_at != created_at) of an issue comment
+or review (inline) comment by a `machine_record_authors` login fails closed,
+whatever it now says: machine-written comments are never edited, so this
+catches a critical edited into "all good now". Limits, audit-only (covered by
+acardote/personal-assistant-ultra#581, not by this stateless check):
+  - edits of a submitted review BODY: the REST reviews API returns no
+    updated_at, and this file makes REST GETs only (no GraphQL
+    `lastEditedAt`), so a review body edited after submission is read as it
+    now stands;
+  - deletion of any comment or review body: a deleted record is simply
+    absent, and a stateless check cannot tell it ever existed. The audit
+    compares the record set across runs. No check run or commit status is read.
 
 The function contract for importers (#580): `compute_verdict` never raises
 and returns a Result with passed=False on any problem; `fetch_and_compute`
@@ -90,6 +107,15 @@ VERIFY_RE = re.compile(
 )
 # Anything that looks like a critical record, in any formatting.
 CRITICAL_LIKE_RE = re.compile(r"(?i)\bcritical\b.*\b(?:id|reviewer|sha)[ \t]*=")
+# A line whose first word, after markdown markup, is "critical" (I-a).
+_LEAD_MARKUP_RE = re.compile(r"^(?:\s+|#{1,6}(?=\s|$)|[-*+](?=\s)|\d{1,9}[.)](?=\s)|\[[ xX]\](?=\s)|[*_~`\[(]+|<[^>]*>)")
+CRITICAL_WORD_RE = re.compile(r"(?i)^critical(?![A-Za-z0-9_]|-[A-Za-z0-9_])")
+# The one exemption: a line that only states there are zero criticals, e.g.
+# "## Critical (0)", "**Critical:** none", "Critical issues: 0".
+CRITICAL_ZERO_RE = re.compile(
+    r"(?i)^critical(?:[ \t]+(?:issues?|findings?))?[*_~`\])]*[ \t]*"
+    r"(?:\([ \t]*0[ \t]*\)|:[*_~`]*[ \t]*(?:0|none)\b[ \t.]*)[*_~`]*[ \t]*$"
+)
 RECORD_LIKE_RE = re.compile(r"(?i)\b(?:verdict|critical|verify)\b.*\b(?:reviewer|sha)[ \t]*=")
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -320,6 +346,23 @@ def _strict(line: str) -> tuple[str, re.Match[str]] | None:
     return None
 
 
+def strip_lead_markup(line: str) -> str:
+    """Strip leading markdown markup (headings, bullets, numbering, task boxes,
+    emphasis, code ticks, brackets, inline HTML tags) so the first word shows."""
+    prev = None
+    while prev != line:
+        prev = line
+        line = _LEAD_MARKUP_RE.sub("", line, count=1)
+    return line
+
+
+def critical_led(line: str) -> bool:
+    """True if the line's first word (after markup) is `critical`, any case,
+    and the line is not only a statement that there are zero criticals."""
+    text = strip_lead_markup(line)
+    return bool(CRITICAL_WORD_RE.match(text)) and not CRITICAL_ZERO_RE.match(text)
+
+
 def normalize_sources(comments: list[dict], reviews: list[dict], review_comments: list[dict]) -> list[dict]:
     """One list of {body, user, created_at, updated_at, where} from the three
     places a reviewer can write on a PR. Pending (unsubmitted) reviews are
@@ -337,8 +380,12 @@ def normalize_sources(comments: list[dict], reviews: list[dict], review_comments
     return out
 
 
-def parse_records(comments: list[dict], trusted: set[str]) -> tuple[list[Record], list[str], list[str]]:
-    """Return (records, notes, fail-closed reasons)."""
+def parse_records(comments: list[dict], trusted: set[str],
+                  machine: set[str] | frozenset[str] = frozenset()) -> tuple[list[Record], list[str], list[str]]:
+    """Return (records, notes, fail-closed reasons).
+
+    `machine` holds the bot logins whose comments are machine-written: any edit
+    of one (updated_at != created_at) fails closed, whatever it now says."""
     records: list[Record] = []
     reasons: list[str] = []
     ignored: dict[str, int] = {}
@@ -369,7 +416,7 @@ def parse_records(comments: list[dict], trusted: set[str]) -> tuple[list[Record]
         # Fail closed on anything that looks like a critical but is not a live record.
         for line in live:
             hit = _strict(line)
-            if CRITICAL_LIKE_RE.search(line) and not (hit and hit[0] == "CRITICAL"):
+            if (CRITICAL_LIKE_RE.search(line) or critical_led(line)) and not (hit and hit[0] == "CRITICAL"):
                 reasons.append(f"unparseable critical in {where} by {login!r} at {created}: {line.strip()[:80]!r}")
         for line in other:
             if CRITICAL_LIKE_RE.search(line):
@@ -383,6 +430,10 @@ def parse_records(comments: list[dict], trusted: set[str]) -> tuple[list[Record]
                     )
         # Records in an edited comment are void, and void records fail closed.
         upd = c.get("updated_at")
+        if upd and created and upd != created and login in machine:
+            reasons.append(f"{where} by machine author {login!r} at {created} was edited at {upd}; "
+                           "machine-written comments are never edited (I-b)")
+            continue
         if upd and created and upd != created and any(RECORD_LIKE_RE.search(l) for l in live + other):
             reasons.append(f"{where} by {login!r} at {created} carries records and was edited at {upd}; "
                            "post records in a new comment and delete the edited one")
@@ -533,7 +584,8 @@ def compute_verdict(*, repo: str, pr: dict, files: list[dict], commits: list[dic
 
         # Records from trusted authors only.
         sources = normalize_sources(comments, reviews, review_comments)
-        records, notes, rec_reasons = parse_records(sources, set(config["trusted_record_authors"]))
+        records, notes, rec_reasons = parse_records(sources, set(config["trusted_record_authors"]),
+                                                  set(config["machine_record_authors"]))
         res.notes += notes
         res.reasons += rec_reasons
         authors = author_agents_for(pr, config)

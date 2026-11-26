@@ -761,8 +761,8 @@ def test_edited_record_comment_fails_closed():
     failed_with(run(comments=passing_comments(reviewers=("pr-reviewer",)) + [c]), "was edited")
 
 
-def test_edited_comment_without_records_is_fine():
-    c = comment("typo fixed in prose", at="2026-11-26T10:05:00Z")
+def test_edited_human_comment_without_records_is_fine():
+    c = comment("typo fixed in prose", login="acardote", at="2026-11-26T10:05:00Z")
     c["updated_at"] = "2026-11-26T12:00:00Z"
     assert run(comments=passing_comments() + [c]).passed
 
@@ -980,3 +980,85 @@ def test_removed_binary_is_not_heavy_by_itself():
     pr = make_pr(labels=[{"name": "weight:trivial"}], additions=0, deletions=0, changed_files=1)
     files = [{"filename": "bin/old.png", "status": "removed", "additions": 0, "deletions": 0}]
     assert run(pr=pr, files=files, comments=passing_comments(reviewers=("pr-challenger",))).passed
+
+
+# Verify I-a: a trusted line whose first word is "critical" and is not a strict record fails closed.
+
+@pytest.mark.parametrize("line", [
+    f"CRITICAL: id 1 reviewer pr-challenger sha {C1}",
+    f"Critical: id: x reviewer: pr-challenger sha: {C1}",
+    "CRITICAL - auth bypass in handler",
+    "critical: auth bypass in handler",
+    "**Critical** auth bypass in handler",
+    "- **CRITICAL**: auth bypass in handler",
+    "1. Critical: auth bypass in handler",
+    "### CRITICAL: auth bypass in handler",
+    "- [ ] `critical` auth bypass",
+    "<b>CRITICAL</b> auth bypass",
+    "CRITICAL",
+    "## Critical",
+    "## Critical (1)",
+    "CRITICAL\u2014auth bypass",
+])
+def test_critical_led_line_fails_closed(line):
+    failed_with(run(comments=passing_comments() + [comment(line, at="2026-11-26T11:00:00Z")]),
+                "unparseable critical")
+
+
+def test_critical_led_line_in_review_body_fails_closed():
+    reviews = [{"body": "CRITICAL - auth bypass in handler", "user": {"login": BOT},
+                "submitted_at": "2026-11-26T11:00:00Z", "state": "COMMENTED"}]
+    failed_with(run(comments=passing_comments(), reviews=reviews), "unparseable critical")
+
+
+@pytest.mark.parametrize("body", [
+    "No critical findings.",
+    "no critical findings",
+    "Not critical; just a nit.",
+    "## Critical (0)",
+    "**Critical:** none",
+    "Critical issues: 0",
+    "- Critical findings (0)",
+    "critical-path analysis looks fine",
+    "Criticality is low.",
+    "The critical path is unchanged.",
+])
+def test_prose_not_led_by_critical_passes(body):
+    assert run(comments=passing_comments() + [comment(body, at="2026-11-26T11:00:00Z")]).passed
+
+
+def test_strict_critical_record_is_a_record_not_unparseable():
+    res = run(comments=with_crit())
+    failed_with(res, "critical 'c1' is open")
+    assert not any("unparseable" in r for r in res.reasons), res.render()
+
+
+def test_untrusted_critical_led_line_is_ignored():
+    c = comment("CRITICAL - auth bypass in handler", login="mallory", at="2026-11-26T11:00:00Z")
+    assert run(comments=passing_comments() + [c]).passed
+
+
+# Verify I-b: any edit of a machine-written comment fails closed, whatever it now says.
+
+def test_edited_bot_comment_without_records_fails_closed():
+    c = comment("all good now", at="2026-11-26T10:05:00Z")
+    c["updated_at"] = "2026-11-26T12:00:00Z"
+    failed_with(run(comments=passing_comments() + [c]), "machine-written comments are never edited")
+
+
+def test_edited_bot_review_comment_fails_closed():
+    rc = [{"body": "all good now", "user": {"login": BOT},
+           "created_at": "2026-11-26T09:00:00Z", "updated_at": "2026-11-26T12:00:00Z"}]
+    failed_with(run(comments=passing_comments(), review_comments=rc), "was edited")
+
+
+def test_unedited_bot_comment_passes():
+    c = comment("all good now", at="2026-11-26T10:05:00Z")
+    c["updated_at"] = c["created_at"]
+    assert run(comments=passing_comments() + [c]).passed
+
+
+def test_missing_machine_authors_config_fails_closed():
+    cfg = copy.deepcopy(CONFIG)
+    del cfg["machine_record_authors"]
+    failed_with(run(config=cfg), "cannot compute verdict")

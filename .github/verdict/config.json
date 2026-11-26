@@ -4,6 +4,9 @@
     "acardote-fleet[bot]",
     "acardote"
   ],
+  "machine_record_authors": [
+    "acardote-fleet[bot]"
+  ],
   "reviewer_agents": [
     "pr-reviewer",
     "pr-challenger",
