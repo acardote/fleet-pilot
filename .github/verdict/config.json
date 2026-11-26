@@ -1,9 +1,28 @@
 {
-  "_comment": "Read by verdict.py from the default branch only. Changing this file is a 7a change (operator merges). Design: acardote/personal-assistant-ultra docs/design/merge-model.md section 2 and 3 step 4; child issue acardote/personal-assistant-ultra#579.",
-  "trusted_record_authors": ["acardote-fleet[bot]", "acardote"],
-  "reviewer_agents": ["pr-reviewer", "pr-challenger", "wario"],
-  "author_agents": ["yoshi", "daisy", "mario", "rosalina", "toad", "toadsworth", "peach"],
-  "weight_tiers": ["trivial", "standard", "heavy"],
+  "_comment": "Read by verdict.py from the default branch only. Changing this file is a 7a change (operator merges). Design: acardote/personal-assistant-ultra docs/design/merge-model.md section 2 and 3 step 4; child issue acardote/personal-assistant-ultra#579. heavy_paths is the verdict's weight floor, matched case-insensitively; it is NOT the 7a auto-merge floor list in merge-model.md section 5 (that list lives with #580), though it includes it.",
+  "trusted_record_authors": [
+    "acardote-fleet[bot]",
+    "acardote"
+  ],
+  "reviewer_agents": [
+    "pr-reviewer",
+    "pr-challenger",
+    "wario"
+  ],
+  "author_agents": [
+    "yoshi",
+    "daisy",
+    "mario",
+    "rosalina",
+    "toad",
+    "toadsworth",
+    "peach"
+  ],
+  "weight_tiers": [
+    "trivial",
+    "standard",
+    "heavy"
+  ],
   "weight_label_prefix": "weight:",
   "weight_thresholds": {
     "trivial_max_loc": 49,
@@ -21,30 +40,55 @@
     "CLAUDE.md",
     ".envrc",
     ".pre-commit-config.yaml",
+    ".gitmodules",
     "templates/git-hooks/**",
     "templates/routines/**",
     "release-policy.yaml",
     "RELEASE.md",
-    "package.json",
-    "pyproject.toml",
-    "go.mod",
-    "go.sum",
-    "Cargo.toml",
+    "docs/policy/autonomy-v2.md",
+    "scripts/pa-session",
+    "tools/lint-*",
+    "tools/_*.py",
+    "tests/fixtures/**",
+    "**/conftest.py",
+    "**/package.json",
+    "**/pyproject.toml",
+    "**/setup.py",
+    "**/setup.cfg",
+    "**/go.mod",
+    "**/go.sum",
+    "**/Cargo.toml",
     "**/requirements*.txt",
     "**/Pipfile*",
     "**/Gemfile*",
     "**/*lock*",
+    "**/.npmrc",
+    "**/.pypirc",
+    "**/uv.toml",
+    "**/Dockerfile*",
+    "**/Makefile",
     "**/migrations/**",
     "**/*.sql",
     "**/*.tf",
     "**/iam/**"
   ],
   "review_sets": {
-    "trivial": ["pr-challenger"],
-    "standard": ["pr-reviewer", "pr-challenger"],
-    "heavy": ["pr-reviewer", "pr-challenger", "wario"]
+    "trivial": [
+      "pr-challenger"
+    ],
+    "standard": [
+      "pr-reviewer",
+      "pr-challenger"
+    ],
+    "heavy": [
+      "pr-reviewer",
+      "pr-challenger",
+      "wario"
+    ]
   },
-  "required_ci_workflows": [".github/workflows/ci.yml"],
+  "required_ci_workflows": [
+    ".github/workflows/ci.yml"
+  ],
   "max_pr_files": 3000,
   "max_pr_commits": 250
 }
