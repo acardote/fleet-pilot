@@ -1777,8 +1777,8 @@ def test_an_api_created_check_run_job_of_another_workflow_is_flagged():
     assert "ci.yml" in next(iter(a.conditions.values()))["summary"]
 
 
-@pytest.mark.parametrize("conclusion,flagged", [("cancelled", False), ("skipped", False), ("success", True)])
-def test_a_runnerless_job_is_accepted_only_when_cancelled_or_skipped(conclusion, flagged):
+@pytest.mark.parametrize("conclusion,flagged", [("cancelled", False), ("skipped", True), ("neutral", True), ("success", True)])
+def test_a_runnerless_job_is_accepted_only_when_cancelled(conclusion, flagged):
     """#594: verdict.yml's concurrency cancels jobs before they get a runner (runner_name null, no steps)."""
     job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion=conclusion)
     a = auditor(r4_world(job=job, cr=dict(LIVE["verdict_check_run"], conclusion=conclusion)))
@@ -1835,3 +1835,55 @@ def test_a_verdict_run_from_a_fork_head_is_flagged():
     a = auditor(r)
     a.forged_checks([], {})
     assert "fork" in next(iter(a.conditions.values()))["summary"]
+
+
+# ---------------------------------------------------------------- fp14 round 3: N1, N2, minors
+
+def test_n1_a_skipped_api_check_from_an_evil_base_verdict_run_is_flagged():
+    """fp14 N1: a verdict.yml defined on base X posts review-verdict 'skipped' (counts as passing) on a
+    head that also heads a main-based PR. The check is a runnerless skipped job of that run."""
+    job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion="skipped")
+    evil = [x.replace("@refs/heads/main", "@refs/heads/X") for x in LIVE["verdict_system_lines"]]
+    a = auditor(r4_world(job=job, cr=dict(LIVE["verdict_check_run"], conclusion="skipped"), logs=verdict_logs(evil)))
+    a.forged_checks([], {})
+    assert list(a.conditions) == [f"R4:{LIVE['verdict_check_run']['id']}"]
+    # even with a main definition line, a runnerless skipped job is not a real verdict
+    b = auditor(r4_world(job=job, cr=dict(LIVE["verdict_check_run"], conclusion="skipped")))
+    b.forged_checks([], {})
+    assert list(b.conditions) == [f"R4:{LIVE['verdict_check_run']['id']}"]
+
+
+def test_n1_the_sibling_guard_runs_before_the_cancelled_shortcut():
+    job = dict(LIVE["verdict_job"], runner_name=None, steps=[], conclusion="cancelled")
+    r = r4_world(job=job, cr=dict(LIVE["verdict_check_run"], conclusion="cancelled"))
+    r[f"repos/{REPO}/pulls?head=acardote%3Aws%2Fe5-positive&state=all"] = [{"number": 11, "base": {"ref": "X"}}]
+    a = auditor(r)
+    a.forged_checks([], {})
+    assert "based on 'X'" in next(iter(a.conditions.values()))["summary"]
+
+
+def test_n2_the_live_audit_code_digest_is_accepted():
+    """fp14 N2: merging this changes audit.py while live state exists; the previous code (main 6e669c8,
+    blobs of the three CODE_PATHS, also reported by PAU `fleet_audit_check.py pins`) is accepted."""
+    assert "98a17784a59aac9499b56fbd005a4c64b726ade5f80f70d1a7511b3c59b6c2e2" in CFG["accepted_previous_code"]
+
+
+@pytest.mark.parametrize("text,flagged", [
+    ("on:\n  pull_request_target:\n  workflow_call:\n", True),
+    ("on: [schedule, workflow_call]\n", True),
+    ("on:\n  schedule:\n# workflow_call is not allowed here\n", False),
+    ("on:\n  schedule:\n", False),
+])
+def test_a_workflow_call_trigger_on_merge_or_verdict_is_flagged(text, flagged):
+    import base64
+    r = world(**{f"repos/{REPO}/contents/.github/workflows/merge.yml": {"content": base64.b64encode(text.encode()).decode()}})
+    a = auditor(r)
+    a.controls(None, {})
+    assert ("R3:workflow-call:.github/workflows/merge.yml" in a.conditions) is flagged
+
+
+def test_the_ok_cache_is_trimmed_by_numeric_id():
+    ok = [f"{i}:success" for i in [9, 10, 100, 99999, 100000]]
+    a = auditor(world(**{f"repos/{REPO}/pulls": []}))
+    got, _, _ = a.forged_checks(ok, {})
+    assert got[-1] == "100000:success" and got[0] == "9:success"

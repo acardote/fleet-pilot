@@ -88,6 +88,7 @@ sees no recent successful run).
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -935,6 +936,19 @@ class Auditor:
         snap = {"rulesets": rulesets, "rules": h(rules),
                 "protection": {"protected": branch.get("protected"), "protection": h(branch.get("protection"))},
                 "workflows": wfs, "labels": labels, "vars": self._vars(vars_ctx)}
+        # The definition proof (system.txt `Job defined at:`) assumes merge.yml and
+        # verdict.yml cannot be called from another workflow: a caller defined
+        # elsewhere would run main's job under main's name.
+        for wf in (self.cfg["merge_workflow"], self.cfg["verdict_workflow"]):
+            try:
+                meta = self.gh.get(f"repos/{r}/contents/{urllib.parse.quote(wf)}?ref={urllib.parse.quote(d)}")
+                text = base64.b64decode(meta.get("content") or "").decode("utf-8", "replace")
+            except (NotFound, ValueError):
+                continue
+            if re.search(r"(?m)^[^#\n]*\bworkflow_call\b", text):
+                self.condition("R3", f"R3:workflow-call:{wf}",
+                               f"{wf} on {d} declares a workflow_call trigger: another workflow could call it, and the "
+                               f"audit's definition proof assumes it cannot")
         exp = self.cfg.get("expected_ruleset")
         if exp and not any(v["name"] == exp and v["enforcement"] == "active" for v in rulesets.values()):
             now_sets = ", ".join("{}={}".format(v["name"], v["enforcement"]) for v in rulesets.values()) or "none"
@@ -1166,7 +1180,10 @@ class Auditor:
         else:
             self.backlogs["checks"] = {"runs": 0}
         seen = {k: v for k, v in seen.items() if k in heads}
-        return sorted(str(x) for x in ok)[-2000:], new_bad, seen
+        def num(k) -> int:      # trim by numeric check-run id (newest kept), not text order
+            head_ = str(k).split(":", 1)[0]
+            return int(head_) if head_.isdigit() else 0
+        return sorted((str(x) for x in ok), key=num)[-2000:], new_bad, seen
 
     def _check_untrusted(self, cr: dict, vpath: str, pr: dict | None = None) -> str | None:
         """A review-verdict check run is trusted only as a job of a verdict.yml
@@ -1175,9 +1192,14 @@ class Auditor:
         the job's. A check run created through the API becomes a runnerless
         job of the run that created it (live: forgery 140152689638 is a job of
         a ci.yml run), so the path check and the definition proof are what
-        stop it; do not reorder or drop them. A runnerless job is accepted only
-        when it was cancelled or skipped (verdict.yml's concurrency group,
-        #594) and the check run says the same: it can never pass a merge."""
+        stop it; do not reorder or drop them. The metadata guards (pull
+        requests on another base, same-head PRs on another base) run first for
+        every case. A runnerless job is accepted without the definition proof
+        only when it was CANCELLED (verdict.yml's concurrency group, #594; such
+        runs have empty log archives) and the check run says the same: a
+        cancelled check never satisfies a required status check. A runnerless
+        `skipped` or `neutral` job would satisfy one (GitHub counts them as
+        passing), so it is flagged (fp14 N1)."""
         r = self.repo
         app = (cr.get("app") or {}).get("id")
         if app != int(self.cfg["actions_app_id"]):
@@ -1201,15 +1223,19 @@ class Auditor:
             return "is a job of a run whose head repository is not this repository (fork)"
         if run.get("event") != "pull_request_target":
             return f"is a job of a {vpath} run on event {run.get('event')!r} (definition not from the default branch)"
-        no_runner = not job.get("runner_name") or not job.get("steps")
-        if no_runner:
-            if job.get("conclusion") in ("cancelled", "skipped"):
-                return None
-            return (f"was created through the API (runner_name={job.get('runner_name')!r}, "
-                    f"steps={len(job.get('steps') or [])}, conclusion {job.get('conclusion')!r})")
+        # Metadata guards first, for every case (fp14 N1).
         why = pr_target_untrusted(run, self.default) or self.sibling_base(run.get("head_branch"))
         if why:
             return f"is a job of an untrusted {vpath} run ({why})"
+        no_runner = not job.get("runner_name") or not job.get("steps")
+        if no_runner and job.get("conclusion") == "cancelled":
+            # verdict.yml's concurrency group cancels jobs before they get a runner,
+            # and their run's log archive is empty (live: run 45890692632), so no
+            # definition proof exists. Accepted only because a cancelled check
+            # never satisfies a required status check. `skipped` and `neutral`
+            # do (GitHub counts them as passing), so they fall through to the
+            # definition proof like any other job.
+            return None
         cache = self._defined
         rid = run.get("id")
         if rid not in cache:
@@ -1219,7 +1245,12 @@ class Auditor:
             except NotFound:
                 cache[rid] = (False, "its run's logs are unavailable (definition unproven)")
         dok, dwhy = cache[rid]
-        return None if dok else f"is a job of a {vpath} run whose definition is not proven to be the default branch's ({dwhy})"
+        if not dok:
+            return f"is a job of a {vpath} run whose definition is not proven to be the default branch's ({dwhy})"
+        if no_runner:
+            return (f"was created through the API (runner_name={job.get('runner_name')!r}, "
+                    f"steps={len(job.get('steps') or [])}, conclusion {job.get('conclusion')!r})")
+        return None
 
     # ---- R5: workflows run from outside the default branch
     def foreign_runs(self, cursor: dict | None, prev_backlog: dict | None = None) -> dict:

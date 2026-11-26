@@ -43,7 +43,9 @@
   "max_run_pages": 10,
   "max_branch_pages": 10,
   "chain_keep": 100,
-  "accepted_previous_code": [],
+  "accepted_previous_code": [
+    "98a17784a59aac9499b56fbd005a4c64b726ade5f80f70d1a7511b3c59b6c2e2"
+  ],
   "public_vars": [
     "AUTO_MERGE_ENABLED"
   ],
