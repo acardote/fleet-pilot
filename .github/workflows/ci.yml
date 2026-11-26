@@ -3,11 +3,14 @@
 # Runs the repo's Python tests if there are any; otherwise succeeds.
 name: ci
 
+# review-verdict counts CI evidence only from PUSH runs on the PR's head branch
+# whose ci.yml equals the default branch's (a pull_request run cannot be tied to
+# the default branch's definition through the API); see fleet-pilot#1 / #579.
 on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: ["**"]
 
 permissions:
   contents: read
