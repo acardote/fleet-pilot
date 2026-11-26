@@ -171,10 +171,20 @@ def entry_digest(entry: dict) -> str:
     return h({k: v for k, v in entry.items() if k != "digest"})
 
 
+# The audit's own integrity FLAGs, carried by kind in the witness so stripping
+# them from the anchor is detectable (R6:gap is excluded: Tier 0 sees gaps itself).
+WITNESS_R6 = ("anchor-mismatch", "anchor-forged", "anchor-behind", "anchor-unreadable", "rebaseline", "issue-moved",
+              "runs-unverifiable")
+
+
 def witness_line(entry: dict) -> str:
     """Kept identical to PAU fleet_audit_check.WITNESS_RE (a vector is pinned on both sides)."""
+    kinds = sorted({f["key"].split(":")[1] for f in entry.get("flags") or []
+                    if f.get("rule") == "R6" and f["key"].split(":")[1] in WITNESS_R6})
+    if entry.get("rebaseline") and "rebaseline" not in kinds:
+        kinds = sorted(kinds + ["rebaseline"])
     return (f"fleet-audit-chain seq={entry['seq']} digest={entry['digest']} run_id={entry['run_id']} "
-            f"flags_total={entry.get('flags_total') or 0}")
+            f"flags_total={entry.get('flags_total') or 0} r6={','.join(kinds) or '-'}")
 
 
 def state_digest(state: dict) -> str:
@@ -496,6 +506,19 @@ class Auditor:
     def condition(self, rule: str, key: str, summary: str) -> None:
         self.conditions[key] = finding(rule, key, summary)
 
+    def _on_main(self, sha: str) -> bool:
+        """The commit is on the default branch (ref type branch, not a tag or
+        other ref that only shares the name)."""
+        cache = self.__dict__.setdefault("_on_main_cache", {})
+        if sha not in cache:
+            try:
+                st = self.gh.get(f"repos/{self.repo}/compare/{sha}...{urllib.parse.quote(self.default)}").get("status") \
+                    if SHA_RE.match(sha) else None
+            except NotFound:
+                st = None
+            cache[sha] = st in ("ahead", "identical")
+        return cache[sha]
+
     def out_of_time(self) -> bool:
         return self.deadline is not None and self.clock() >= self.deadline
 
@@ -689,6 +712,9 @@ class Auditor:
                 continue
             created = ts(run.get("created_at"))
             if created is not None and created > merged_at:
+                continue
+            if run.get("event") == "schedule" and not self._on_main(run.get("head_sha") or ""):
+                seen.append(f"run {rid}: schedule run whose commit is not on {self.default} (a ref named like it)")
                 continue
             if run.get("status") != "completed":
                 if created is not None and self.now - created <= max_pending:
@@ -1020,7 +1046,6 @@ class Auditor:
                       f"ones in that window were not checked (a run flood)")
         default_blobs: dict | None = None
         trees: dict[str, dict] = {}
-        on_main: dict[str, bool] = {}
         new = sorted((x for x in runs if int(x.get("id") or 0) > last_id), key=lambda x: int(x["id"]))
         for run in new:
             path = run.get("path") or ""
@@ -1034,14 +1059,7 @@ class Auditor:
             if run.get("head_branch") == self.default and event != "pull_request":
                 # A tag (or other ref) named like the default branch reports the
                 # same head_branch: the commit must be on the default branch.
-                if sha not in on_main:
-                    try:
-                        st = self.gh.get(f"repos/{r}/compare/{sha}...{urllib.parse.quote(self.default)}").get("status") \
-                            if SHA_RE.match(sha) else None
-                    except NotFound:
-                        st = None
-                    on_main[sha] = st in ("ahead", "identical")
-                if on_main[sha]:
+                if self._on_main(sha):
                     continue
                 self.flag("R5", f"R5:run:{run.get('id')}",
                           f"workflow run {run.get('id')} ({path}, event {event!r}) reports ref {self.default!r} but its "
@@ -1450,7 +1468,8 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
                  "records_cursor": records_cursor, "checks_ok": checks_ok, "checks_bad": checks_bad,
                  "runs_cursor": runs_cursor, "branches": branches, "issue": issue,
                  "open": [c["key"] for c in conditions]}
-    entry = make_entry(seq, prev_digest, env, new_head, code, state_digest(new_state), a.findings + new_conditions,
+    ordered = sorted(a.findings, key=lambda f: f["rule"] != "R6")   # integrity FLAGs first (never capped away)
+    entry = make_entry(seq, prev_digest, env, new_head, code, state_digest(new_state), ordered + new_conditions,
                        conditions, audited_at, rebaseline)
     new_state["chain"] = (base_chain + [entry])[-int(cfg["chain_keep"]):]
     plan = {"events": a.findings, "new_conditions": new_conditions, "conditions": conditions, "entry": entry}
@@ -1541,7 +1560,7 @@ def main(argv: list[str] | None = None) -> int:
         # this entry, so an anchor rewritten to strip FLAGs is detected.
         head = state["chain"][-1]
         print(f"::notice title={WITNESS_TITLE}::{witness_line(head)}", flush=True)
-        for f in new[:9]:    # 10 warnings per step; FLAGs readable on the run page and by the front door
+        for f in sorted(new, key=lambda f: f["rule"] != "R6")[:9]:    # 10 warnings per step; integrity FLAGs first; FLAGs readable on the run page and by the front door
             print(f"::warning title=FLAG {f['rule']}::{f['summary'].replace('::', ': :')[:300]}")
     except NoOp as e:
         print(f"merge-audit: {e}")
@@ -1552,11 +1571,14 @@ def main(argv: list[str] | None = None) -> int:
             cand, run, skipped = newest_readable_state(gh, args.repo, cfg, env) if gh is not None else (None, None, [])
             would = (f"run {run['id']} (#{run.get('run_number')}, seq {cand['chain'][-1]['seq']}, head "
                      f"{str(cand.get('head'))[:12]})") if cand else "nothing (fresh)"
-            print(f"merge-audit: rebaseline=continue would adopt {would}; skipped: {'; '.join(skipped) or 'none'}")
+            print(f"merge-audit: for the record, rebaseline=continue would adopt {would}; it would skip: "
+                  f"{'; '.join(skipped) or 'none'}")
         except Exception as e3:  # noqa: BLE001
             print(f"merge-audit: could not compute the rebaseline candidate: {type(e3).__name__}: {e3}")
-        print("merge-audit: investigate first; then dispatch audit.yml with rebaseline=continue or rebaseline=fresh. "
-              "The front door alerts on any rebaseline.")
+        print("merge-audit: this may be tampering. Do NOT rebaseline by reflex: find out why the state is broken "
+              "(deleted runs or artifacts, altered audit code, an edited findings issue) and confirm the cause first. "
+              "Only then dispatch audit.yml with a rebaseline mode and a reason; fresh is the conservative choice "
+              "when the cause is unclear. The front door alerts on any rebaseline.")
         try:
             if gh is not None and not args.dry_run:
                 mark_broken(gh, args.repo, getattr(e, "issue", None), getattr(e, "anchor", None), str(e))

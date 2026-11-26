@@ -113,8 +113,8 @@ def good_log(run_id=100, pr=5, head=H1, ref=REF):
 
 
 def merge_run(rid=100, event="schedule", branch="main", prs=None, status="completed", conclusion="success",
-              created="2026-11-27T11:29:00Z", path=".github/workflows/merge.yml"):
-    return {"id": rid, "event": event, "head_branch": branch, "path": path, "status": status,
+              created="2026-11-27T11:29:00Z", path=".github/workflows/merge.yml", head=BASE):
+    return {"id": rid, "event": event, "head_branch": branch, "path": path, "status": status, "head_sha": head,
             "conclusion": conclusion, "created_at": created, "repository": {"full_name": REPO},
             "head_repository": {"full_name": REPO}, "pull_requests": prs or []}
 
@@ -149,6 +149,7 @@ def world(**over) -> dict:
                                   "title": "feat: x", "labels": []},
         f"repos/{REPO}/actions/workflows/merge.yml/runs": {"workflow_runs": [merge_run()]},
         f"repos/{REPO}/actions/runs/100/logs": good_log(),
+        f"repos/{REPO}/compare/{BASE}...main": {"status": "ahead"},
         f"repos/{REPO}/events": [],
         f"repos/{REPO}/rulesets": [{"id": 9, "name": "e5-main", "enforcement": "active",
                                     "updated_at": "2026-11-27T10:00:00Z", "target": "branch", "source_type": "Repository"}],
@@ -1225,12 +1226,15 @@ def test_rebaseline_continue_never_adopts_state_from_other_code():
     assert s2["chain"][-1]["rebaseline"]["adopted_run"] == 200 and "ran audit code" in s2["chain"][-1]["rebaseline"]["skipped"][0]
 
 
-WITNESS_VECTOR = "fleet-audit-chain seq=7 digest=" + "ab" * 32 + " run_id=99 flags_total=2"
+WITNESS_VECTOR = "fleet-audit-chain seq=7 digest=" + "ab" * 32 + " run_id=99 flags_total=2 r6=anchor-mismatch,rebaseline"
 
 
 def test_witness_line_vector_matches_the_front_door():
     """PAU tests/test_fleet_audit_check.py parses the same line."""
-    assert au.witness_line({"seq": 7, "digest": "ab" * 32, "run_id": 99, "flags_total": 2}) == WITNESS_VECTOR
+    e = {"seq": 7, "digest": "ab" * 32, "run_id": 99, "flags_total": 2, "rebaseline": {"mode": "fresh"},
+         "flags": [{"rule": "R6", "key": "R6:anchor-mismatch:3:9"}, {"rule": "R6", "key": "R6:gap:9"}]}
+    assert au.witness_line(e) == WITNESS_VECTOR
+    assert au.witness_line({"seq": 1, "digest": "c" * 64, "run_id": 2, "flags": []}).endswith("flags_total=0 r6=-")
 
 
 def test_main_emits_exactly_one_witness_after_resuming_commands(monkeypatch, tmp_path, capsys):
@@ -1263,3 +1267,19 @@ def test_issue_recreated_late_is_found_newest_first():
                                {"number": 900, "title": CFG["findings_issue_title"], "user": {"login": "github-actions[bot]"},
                                 "body": "b"}]}))
     assert au.find_issue(fake, REPO, CFG) == (900, "b")
+
+
+def test_a_schedule_merge_run_whose_commit_is_not_on_main_proves_nothing():
+    """addendum V-I3: a trusted run of the workflow at main, not a ref that only shares the name."""
+    run = merge_run(head=OTHER)
+    a = auditor(world(**{f"repos/{REPO}/actions/workflows/merge.yml/runs": {"workflow_runs": [run]},
+                         f"repos/{REPO}/compare/{OTHER}...main": {"status": "diverged"}}))
+    a.audit_commits(None, M1)
+    assert rules_of(a) == ["R1:provenance"] and "not on main" in a.findings[0]["summary"]
+
+
+def test_integrity_flags_are_first_in_the_capped_entry():
+    flags = [au.finding("R2", f"R2:direct:{i}", "x") for i in range(40)] + [au.finding("R6", "R6:anchor-mismatch:1:2", "y")]
+    ordered = sorted(flags, key=lambda f: f["rule"] != "R6")
+    e = au.make_entry(2, "p", env(), M1, "c", "s", ordered, [], "t", None)
+    assert e["flags"][0]["rule"] == "R6" and "r6=anchor-mismatch" in au.witness_line(e)
