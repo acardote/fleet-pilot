@@ -1253,8 +1253,9 @@ def load_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv, anchor: dict | Non
         return None
     pred = runs[0]
     if env.run_number and pred.get("run_number") and int(pred["run_number"]) >= int(env.run_number):
-        raise NoOp(f"this is run #{env.run_number}, older than the newest successful audit run "
-                   f"#{pred['run_number']} (a re-run of an old run): nothing written")
+        raise AuditError(f"this is run #{env.run_number}, older than the newest successful audit run "
+                         f"#{pred['run_number']} (a re-run of an old failed run): refused, so it can never become a "
+                         f"successful run that the next run mistakes for its predecessor")
     # run_number continuity: a deleted audit run leaves a permanent gap
     if env.run_number and pred.get("run_number"):
         wf = cfg["audit_workflow"].rsplit("/", 1)[-1]
@@ -1351,6 +1352,16 @@ def newest_readable_state(gh: GitHub, repo: str, cfg: dict, env: RunEnv) -> tupl
     return None, None, skipped
 
 
+def flag_line(f: dict) -> str:
+    """One posted FLAG line. Kept identical to PAU fleet_audit_check (it rebuilds
+    flags_digest from the posted lines when an entry's FLAG list is capped)."""
+    return f"- `FLAG` {f['rule']} `{f['key']}`: {f['summary']}".replace("@", "@\u200b")
+
+
+def flags_digest(flags: list[dict]) -> str:
+    return hashlib.sha256("\n".join(flag_line(f) for f in flags).encode()).hexdigest()
+
+
 def chunks(text: str, size: int = COMMENT_CHUNK) -> list[str]:
     """Split at line boundaries; every FLAG is posted, nothing is truncated."""
     out, cur = [], ""
@@ -1365,19 +1376,30 @@ def chunks(text: str, size: int = COMMENT_CHUNK) -> list[str]:
     return out
 
 
-def render(events: list[dict], new_conditions: list[dict], open_conditions: list[dict], ledger: list[str],
-           notes: list[str], run_url: str, seq: int) -> str:
-    out = [f"## merge-audit run {run_url} (chain seq {seq})", ""]
-    out.append(f"### FLAGs ({len(events) + len(new_conditions)} new)")
-    out += [f"- `FLAG` {f['rule']}: {f['summary']}" for f in events + new_conditions] or ["(none)"]
+def render_header(run_url: str, seq: int, part: int | None = None, parts: int | None = None) -> str:
+    tail = f", part {part}/{parts}" if part else ""
+    return f"## merge-audit run {run_url} (chain seq {seq}{tail})"
+
+
+def render_body(events: list[dict], new_conditions: list[dict], open_conditions: list[dict], ledger: list[str],
+                notes: list[str]) -> str:
+    def nm(x: str) -> str:
+        return x.replace("@", "@\u200b")   # never mention anyone
+    out = [f"### FLAGs ({len(events) + len(new_conditions)} new)"]
+    out += [flag_line(f) for f in events + new_conditions] or ["(none)"]
     if open_conditions:
         out += ["", f"### Open conditions ({len(open_conditions)}, re-checked every run)"]
-        out += [f"- {f['rule']}: {f['summary']}" for f in open_conditions]
+        out += [nm(f"- {f['rule']}: {f['summary']}") for f in open_conditions]
     if ledger:
-        out += ["", "### Audited default-branch commits and pushes"] + [f"- {clean(x)}" for x in ledger]
+        out += ["", "### Audited default-branch commits and pushes"] + [nm(f"- {clean(x)}") for x in ledger]
     if notes:
-        out += ["", "### Notes"] + [f"- {clean(x)}" for x in notes]
-    return "\n".join(out).replace("@", "@​")   # never mention anyone
+        out += ["", "### Notes"] + [nm(f"- {clean(x)}") for x in notes]
+    return "\n".join(out)
+
+
+def render(events: list[dict], new_conditions: list[dict], open_conditions: list[dict], ledger: list[str],
+           notes: list[str], run_url: str, seq: int) -> str:
+    return render_header(run_url, seq) + "\n\n" + render_body(events, new_conditions, open_conditions, ledger, notes)
 
 
 def make_entry(seq: int, prev: str, env: RunEnv, head: str, code: str, sdigest: str, events: list[dict],
@@ -1386,10 +1408,43 @@ def make_entry(seq: int, prev: str, env: RunEnv, head: str, code: str, sdigest: 
         return {"rule": f["rule"], "key": f["key"][:200], "summary": f["summary"][:SUMMARY_CAP]}
     e = {"seq": seq, "prev": prev, "run_id": env.run_id, "run_number": env.run_number, "audited_at": audited_at,
          "head": head, "code": code, "state": sdigest, "flags": [slim(f) for f in events[:ENTRY_FLAGS_CAP]],
-         "flags_total": len(events), "open": [slim(f) for f in conditions[:ENTRY_OPEN_CAP]],
+         "flags_total": len(events), "flags_digest": flags_digest(events),
+         "open": [slim(f) for f in conditions[:ENTRY_OPEN_CAP]],
          "open_total": len(conditions), "rebaseline": rebaseline}
     e["digest"] = entry_digest(e)
     return e
+
+
+def rerun_guard(gh: GitHub, repo: str, cfg: dict, env: RunEnv) -> None:
+    """A re-run attempt. If an earlier attempt of this run SUCCEEDED, it already
+    wrote the chain entry, the witness and the state: write nothing (NoOp), so
+    the entry the front door may have seen is never rewritten. That needs the
+    earlier attempt's state artifact to still be listed for this run (not
+    verified live); if it is not, fail this attempt rather than leave a
+    successful run without state (a failed run is never a predecessor, so the
+    next run continues normally; the front door may report a fork at this
+    run's seq, loudly). If no earlier attempt succeeded (the usual "Re-run
+    failed jobs"), or that cannot be read, run the audit normally."""
+    prior = None
+    for k in range(1, env.run_attempt):
+        try:
+            att = gh.get(f"repos/{repo}/actions/runs/{env.run_id}/attempts/{k}")
+        except AuditError:
+            continue
+        if att.get("conclusion") == "success":
+            prior = k
+    if prior is None:
+        return
+    try:
+        arts = (gh.get(f"repos/{repo}/actions/runs/{env.run_id}/artifacts?per_page=100") or {}).get("artifacts") or []
+    except AuditError:
+        arts = []
+    if any(x.get("name") == cfg["state_artifact"] and not x.get("expired") for x in arts):
+        raise NoOp(f"attempt {env.run_attempt} of run {env.run_id}: attempt {prior} already succeeded and wrote the chain "
+                   f"entry, the witness and the state; nothing written")
+    raise AuditError(f"attempt {env.run_attempt} of run {env.run_id}: attempt {prior} succeeded but its state artifact is "
+                     f"not listed after the re-run; failing this attempt so the run is not taken as a predecessor without "
+                     f"state (the next run continues from the previous run's state)")
 
 
 def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now: datetime | None = None,
@@ -1398,8 +1453,7 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
     """Returns (state, plan, auditor, issue_number). The caller posts the plan
     (comments + anchor) and writes the state file. Raises StateBroken / AuditError."""
     if env.run_attempt > 1:
-        raise NoOp(f"attempt {env.run_attempt} of run {env.run_id}: a re-run never rewrites the chain entry the first "
-                   f"attempt wrote (the front door reads attempt 1's witness); nothing written")
+        rerun_guard(gh, repo, cfg, env)
     meta = gh.get(f"repos/{repo}")
     if meta.get("default_branch") != cfg["default_branch"]:
         raise AuditError(f"default branch is {meta.get('default_branch')!r}, config says {cfg['default_branch']!r}")
@@ -1444,8 +1498,17 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
     else:
         top = max([0] + [e.get("seq") or 0 for e in a_entries] + [((state or {}).get("chain") or [{}])[-1].get("seq") or 0])
         seq = top + 1
-        prev_digest = (a_entries[-1].get("digest") if a_entries else None) or \
-            (((state or {}).get("chain") or [{}])[-1].get("digest")) or GENESIS
+        if state and state.get("chain"):
+            # Chain from the state we actually adopted (verified), not from an
+            # anchor the admin may have edited; the front door can then walk on
+            # through the rebaseline entry to what it saw before.
+            prev_digest = state["chain"][-1]["digest"]
+        else:
+            prev_digest = (a_entries[-1].get("digest") if a_entries else None) or GENESIS
+        if rebaseline is not None:
+            head_e = ((state or {}).get("chain") or [{}])[-1]
+            rebaseline["prev_seq"] = head_e.get("seq")
+            rebaseline["prev_flags_total"] = head_e.get("flags_total")
         base_chain = list((state or {}).get("chain") or []) if rebaseline and rebaseline["mode"] == "continue" else []
     a.seq = seq
     head = gh.get(f"repos/{repo}/branches/{urllib.parse.quote(cfg['default_branch'])}")["commit"]["sha"]
@@ -1472,7 +1535,7 @@ def run_audit(gh: GitHub, repo: str, cfg: dict, env: RunEnv, vars_ctx: dict, now
     entry = make_entry(seq, prev_digest, env, new_head, code, state_digest(new_state), ordered + new_conditions,
                        conditions, audited_at, rebaseline)
     new_state["chain"] = (base_chain + [entry])[-int(cfg["chain_keep"]):]
-    plan = {"events": a.findings, "new_conditions": new_conditions, "conditions": conditions, "entry": entry}
+    plan = {"events": ordered, "new_conditions": new_conditions, "conditions": conditions, "entry": entry}
     return new_state, plan, a, issue
 
 
@@ -1494,8 +1557,13 @@ def publish(gh: GitHub, repo: str, cfg: dict, env: RunEnv, state: dict, plan: di
         entry["digest"] = entry_digest(entry)
         state["chain"][-1] = entry
     if plan["events"] or plan["new_conditions"] or a.ledger:
-        for part in chunks(text):
-            gh.post(f"repos/{repo}/issues/{issue}/comments", {"body": part})
+        # Every part carries the run and seq, so the front door can rebuild the
+        # full FLAG list of a capped entry and check it against flags_digest.
+        body = render_body(plan["events"], plan["new_conditions"], plan["conditions"], a.ledger, a.notes)
+        parts = chunks(body, COMMENT_CHUNK - 300)
+        for i, part in enumerate(parts, start=1):
+            gh.post(f"repos/{repo}/issues/{issue}/comments",
+                    {"body": render_header(run_url, state["seq"], i, len(parts)) + "\n\n" + part})
     gh.patch(f"repos/{repo}/issues/{issue}", {"body": render_anchor(repo, state["chain"])})
     return issue, text
 
@@ -1564,6 +1632,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"::warning title=FLAG {f['rule']}::{f['summary'].replace('::', ': :')[:300]}")
     except NoOp as e:
         print(f"merge-audit: {e}")
+        out = os.environ.get("GITHUB_OUTPUT")
+        if out:
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write("noop=true\n")
         return 0
     except StateBroken as e:
         print(f"merge-audit: FAIL (fail closed): state broken: {e}")

@@ -19,6 +19,7 @@ answers that query, so the parameters the audit sends are tested too.
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import re
@@ -1178,7 +1179,8 @@ def test_workflow_guard_checkout_and_pins():
     run_blocks = "\n".join(re.findall(r"run: \|\n((?:          .*\n)+)", t))
     assert "${{" not in run_lines and "${{" not in run_blocks
     assert "REBASELINE: ${{ inputs.rebaseline }}" in t       # dispatch inputs only through env
-    assert "if: github.run_attempt == '1'" in t.split("Save state for the next run", 1)[1].split("uses:", 1)[0]
+    assert "if: steps.audit.outputs.noop != 'true'" in t.split("Save state for the next run", 1)[1].split("uses:", 1)[0]
+    assert "id: audit" in t
     assert "name: fleet-audit-state" in t and CFG["state_artifact"] == "fleet-audit-state"
 
 
@@ -1190,18 +1192,48 @@ def test_script_stops_workflow_commands_before_printing_repo_text():
 
 # ---------------------------------------------------------------- round 2 (verify pass)
 
-def test_a_rerun_attempt_writes_nothing():
-    """verify V-I4: "Re-run all jobs" must not rewrite seq N (Tier 0 would see a fork)."""
+def rerun_env(attempt=2):
+    return au.RunEnv(300, 2, WSHA, "a", "schedule", run_attempt=attempt)
+
+
+def test_a_rerun_of_a_run_that_already_succeeded_writes_nothing():
+    """verify V-I4: "Re-run all jobs" must not rewrite the seq the first attempt wrote."""
     state, _ = first_state()
-    with pytest.raises(au.NoOp, match="attempt 2"):
-        au.run_audit(FakeGH(second_world(state)), REPO, CFG, au.RunEnv(200, 1, WSHA, "a", "schedule", run_attempt=2), {})
+    r = second_world(state, **{f"repos/{REPO}/actions/runs/300/attempts/1": {"conclusion": "success"},
+                               f"repos/{REPO}/actions/runs/300/artifacts": {"artifacts": [{"name": "fleet-audit-state"}]}})
+    with pytest.raises(au.NoOp, match="attempt 1 already succeeded"):
+        au.run_audit(FakeGH(r), REPO, CFG, rerun_env(), {})
 
 
-def test_a_run_older_than_the_predecessor_writes_nothing():
-    """verify V-I4: a re-run of an old run would append an entry and wedge the next run as a rollback."""
+def test_a_rerun_of_a_failed_run_audits_normally():
+    """verify2 V2-I1: "Re-run failed jobs" after a transient failure must not become a success without state."""
+    state, _ = first_state()
+    r = second_world(state, **{f"repos/{REPO}/actions/runs/300/attempts/1": {"conclusion": "failure"}})
+    s2, plan, a, issue = au.run_audit(FakeGH(r), REPO, CFG, rerun_env(), {}, now=NOW, sleep=lambda s: None)
+    assert s2["chain"][-1]["seq"] == 2 and s2["run_id"] == 300
+
+
+def test_a_rerun_whose_earlier_success_lost_its_artifact_fails_instead_of_wedging():
+    """verify2 V2-I1: if the earlier attempt's artifact is not listed after a re-run, fail this attempt
+    (a failed run is never a predecessor) rather than leave a successful run without state."""
+    state, _ = first_state()
+    r = second_world(state, **{f"repos/{REPO}/actions/runs/300/attempts/1": {"conclusion": "success"},
+                               f"repos/{REPO}/actions/runs/300/artifacts": {"artifacts": []}})
+    with pytest.raises(au.AuditError, match="not listed"):
+        au.run_audit(FakeGH(r), REPO, CFG, rerun_env(), {})
+
+
+def test_unreadable_attempts_fall_back_to_auditing_normally():
+    state, _ = first_state()
+    s2, *_ = au.run_audit(FakeGH(second_world(state)), REPO, CFG, rerun_env(3), {}, now=NOW, sleep=lambda s: None)
+    assert s2["chain"][-1]["seq"] == 2
+
+
+def test_a_rerun_of_an_old_failed_run_is_refused_not_a_success():
+    """verify V-I4: it would otherwise append an entry and wedge the next run as a rollback."""
     state, _ = first_state()
     r = second_world(state, runs=[audit_run(200, 5)])
-    with pytest.raises(au.NoOp, match="older than"):
+    with pytest.raises(au.AuditError, match="older than"):
         load(r, env(150, 3))
 
 
@@ -1253,12 +1285,53 @@ def test_main_emits_exactly_one_witness_after_resuming_commands(monkeypatch, tmp
     assert out.index(notes[0]) > resume
 
 
-def test_main_rerun_attempt_exits_zero_without_state(monkeypatch, tmp_path):
-    monkeypatch.setattr(au, "GitHub", lambda *a, **k: FakeGH(world()))
-    for k, v in dict(GH_TOKEN="t", GITHUB_RUN_ID="300", GITHUB_RUN_NUMBER="2", GITHUB_RUN_ATTEMPT="2").items():
+def test_main_noop_rerun_exits_zero_and_tells_the_upload_step(monkeypatch, tmp_path):
+    state, _ = first_state()
+    r = second_world(state, **{f"repos/{REPO}/actions/runs/300/attempts/1": {"conclusion": "success"},
+                               f"repos/{REPO}/actions/runs/300/artifacts": {"artifacts": [{"name": "fleet-audit-state"}]}})
+    monkeypatch.setattr(au, "GitHub", lambda *a, **k: FakeGH(r))
+    out = tmp_path / "out"
+    for k, v in dict(GH_TOKEN="t", GITHUB_RUN_ID="300", GITHUB_RUN_NUMBER="2", GITHUB_RUN_ATTEMPT="2",
+                     GITHUB_OUTPUT=str(out)).items():
         monkeypatch.setenv(k, v)
     assert au.main(["--repo", REPO, "--config", str(HERE / "config.json"), "--state-out", str(tmp_path / "s.json")]) == 0
-    assert not (tmp_path / "s.json").exists()
+    assert not (tmp_path / "s.json").exists() and out.read_text() == "noop=true\n"
+
+
+def test_capped_flags_can_be_rebuilt_from_the_posted_comments():
+    """verify2 V2-M2: entries cap FLAGs at 25; flags_digest lets the front door verify the full posted list."""
+    many = [au.finding("R2", f"R2:direct:{i}", "x " * 600 + "@someone") for i in range(120)]
+    body = au.render_body(many, [], [], [], [])
+    parts = au.chunks(body, au.COMMENT_CHUNK - 300)
+    assert len(parts) > 1
+    lines = [ln for p in parts for ln in p.splitlines() if ln.startswith("- `FLAG` ")]
+    assert hashlib.sha256("\n".join(lines).encode()).hexdigest() == au.flags_digest(many)
+    e = au.make_entry(2, "p", env(), M1, "c", "s", many, [], "t", None)
+    assert len(e["flags"]) == 25 and e["flags_total"] == 120 and e["flags_digest"] == au.flags_digest(many)
+
+
+def test_published_comment_parts_carry_run_and_seq():
+    state, _ = first_state()
+    r = second_world(state, **{f"repos/{REPO}/labels/do-not-auto-merge": au.NotFound("x")})
+    gh = FakeGH(r)
+    s2, plan, a, issue = au.run_audit(gh, REPO, CFG, env(), {}, now=NOW, sleep=lambda s: None)
+    au.publish(gh, REPO, CFG, env(), s2, plan, a, issue, dry_run=False)
+    posted = [b["body"] for p, b in gh.posts if p.endswith("/comments")]
+    assert posted and posted[0].startswith(f"## merge-audit run https://github.com/{REPO}/actions/runs/300 (chain seq 2, part 1/1)")
+
+
+def test_a_rebaseline_chains_from_the_adopted_state_not_the_anchor():
+    """verify2 V2-M1: after a strip, the anchor's head is forged; a rebaseline that loaded the real
+    state chains from it, and records the previous seq and FLAG count."""
+    state, _ = first_state()
+    forged = dict(state["chain"][-1], flags=[], flags_total=0, head=OTHER)
+    forged["digest"] = au.entry_digest(forged)
+    r = second_world(state, anchor_entries=[forged])
+    e = env(event="workflow_dispatch", rebaseline="continue", reason="after strip")
+    s2, *_ = au.run_audit(FakeGH(r), REPO, CFG, e, {}, now=NOW, sleep=lambda s: None)
+    rb = s2["chain"][-1]
+    assert rb["prev"] == state["chain"][-1]["digest"] != forged["digest"]
+    assert rb["rebaseline"]["prev_seq"] == 1 and rb["rebaseline"]["prev_flags_total"] == state["chain"][-1]["flags_total"]
 
 
 def test_issue_recreated_late_is_found_newest_first():
@@ -1283,3 +1356,8 @@ def test_integrity_flags_are_first_in_the_capped_entry():
     ordered = sorted(flags, key=lambda f: f["rule"] != "R6")
     e = au.make_entry(2, "p", env(), M1, "c", "s", ordered, [], "t", None)
     assert e["flags"][0]["rule"] == "R6" and "r6=anchor-mismatch" in au.witness_line(e)
+
+
+def test_flag_line_vector_matches_the_front_door():
+    """PAU tests/test_fleet_audit_check.py pins the same line."""
+    assert au.flag_line({"rule": "R2", "key": "R2:direct:x", "summary": "by @a"}) == "- `FLAG` R2 `R2:direct:x`: by @​a"
