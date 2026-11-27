@@ -57,10 +57,13 @@ Per run (.github/workflows/merge.yml calls this from the default branch only):
   8. Merge: `gh pr merge <n> --squash --match-head-commit H`. If the call fails
      or times out, the PR is re-read: merged at H by merger_login counts as
      merged (MERGE-CONFIRMED + MERGED). A refusal caused by the check
-     (kind=check-stale: "required status check", or "base branch policy"
-     while a verdict.yml run at H is pending or newer than the one waited on)
-     is retried ONCE in this run (MERGE-RETRY), after steps 7 and 6 again.
-     Anything else is MERGE-REFUSED. The next schedule run recomputes steps
+     (kind=check-stale: "required status check", or "base branch policy
+     prohibits the merge") is retried ONCE in this run (MERGE-RETRY), after a
+     POLICY_SETTLE_S pause and steps 7, 4, 5 and 6 again. GitHub's merge-policy
+     evaluation can lag a review-verdict success that step 7 already read
+     (ee-fleet-pilot run 46070064439), so the policy refusal is retried even
+     when the check at H looks settled and unchanged. A second refusal is
+     MERGE-REFUSED, never looped; anything else is MERGE-REFUSED at once. The next schedule run recomputes steps
      2-7 from scratch.
 
 Log contract with the #581 audit (fleet-pilot#4 .github/audit/audit.py,
@@ -1902,11 +1905,14 @@ VERDICT_NONE_GRACE_S = 30    # per attempt, while no verdict.yml run at H exists
 VERDICT_POLL_S = 10
 VERDICT_RUNS_PAGE = 100      # newest verdict.yml runs at H read (one page, newest first)
 RUN_DEADLINE_S = 600         # no wait and no merge call after this, from run start (job timeout: 20 minutes)
+POLICY_SETTLE_S = 15         # pause before the one in-run retry of a check-stale refusal (merge-policy lag)
 
 
 def is_check_refusal(msg: str) -> bool:
+    """The refusal is about the required review-verdict check, so it may clear in seconds:
+    "required status check", or the ruleset's "base branch policy prohibits the merge"."""
     low = msg.lower()
-    return "required status check" in low or "base branch policy" in low
+    return "required status check" in low or "base branch policy prohibits the merge" in low
 
 
 class Runner:
@@ -2034,21 +2040,11 @@ class Runner:
             return self.skip(n, head, f"merged by another actor {q(merged_by)}; not this run")
         return None
 
-    def refusal_kind(self, head: str, msg: str, waited_run: int | None) -> str:
-        """check-stale: the refusal is about the required check. "required status check" always is;
-        "base branch policy" is only while a verdict.yml run at H is pending or newer than the run
-        step 7 waited on (the race of #596). Anything else, or an unreadable state, is "other"."""
-        low = msg.lower()
-        if "required status check" in low:
-            return "check-stale"
-        if "base branch policy" in low:
-            try:
-                state, rid, _ = self.verdict_check_state(head)
-            except Exception:  # noqa: BLE001 - cannot tell: not retried
-                return "other"
-            if state == "pending" or rid != waited_run:
-                return "check-stale"
-        return "other"
+    def refusal_kind(self, msg: str) -> str:
+        """check-stale: the refusal is about the required check ("required status check", or "base
+        branch policy prohibits the merge": the policy can lag a success step 7 already read, the race
+        of #596 and ee-fleet-pilot run 46070064439). Anything else is "other" and is not retried."""
+        return "check-stale" if is_check_refusal(msg) else "other"
 
     def log_refused(self, n: int, head: str, msg: str, kind: str) -> str:
         log(f"MERGE-REFUSED pr={n} head={head} kind={kind} reason={q(msg)}")
@@ -2182,9 +2178,13 @@ class Runner:
             settled = self.confirm_after_failed_merge(n, head, msg)
             if settled is not None:
                 return settled
-            kind = self.refusal_kind(head, msg, rid) if is_check_refusal(msg) else "other"
+            kind = self.refusal_kind(msg)
             if kind == "check-stale" and attempt == 1:
-                log(f"MERGE-RETRY pr={n} head={head} kind=check-stale reason={q(msg)}")
+                # One retry: pause for the merge policy to see the check, then re-read the check (7),
+                # re-verify (4, 5), re-read the kill label, head and base (6), and re-check the run
+                # deadline (the AUTO_MERGE_ENABLED latency bound) before the second, H-pinned call.
+                log(f"MERGE-RETRY pr={n} head={head} kind=check-stale wait={POLICY_SETTLE_S}s reason={q(msg)}")
+                self.sleep(POLICY_SETTLE_S)
                 continue
             return self.log_refused(n, head, msg, kind)
         raise AssertionError("unreachable")  # pragma: no cover
