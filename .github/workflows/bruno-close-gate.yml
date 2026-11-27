@@ -4,6 +4,21 @@
 # repo's SHA-pinning convention (ci.yml). Refresh from the template; do not edit
 # the gate logic here (acardote/personal-assistant-ultra#583).
 #
+# Local change 2 (operator decision 2026-11-27,
+# acardote/personal-assistant-ultra#530 comment 7221571981; upstream gap
+# acardote/bruno-method#123): fleet leads post through the agent-gh broker as
+# the App `acardote-fleet[bot]`, and the broker prefixes every body with
+# `[agent-posted] `. So:
+#   - comments by exactly `acardote-fleet[bot]` (user.type Bot) are kept; every
+#     other bot is still filtered out;
+#   - a leading `[agent-posted]` tag is stripped from comment bodies before the
+#     heading checks, so `[agent-posted] ## Reconciliation (move:5)` counts;
+#   - that App passes the reconciliation actor check (a bot login cannot be
+#     permission-checked as a collaborator);
+#   - `## Owner disposition` records stay human-only: the App's are ignored.
+# Provenance, falsifier, parent-link and label checks are unchanged. Tests:
+# .github/bruno/test_close_gate.py.
+#
 # Bruno close-gate
 #
 # Mechanically enforces SPEC §5.5 (Move 5 — Closure Against Reality):
@@ -132,6 +147,10 @@ jobs:
             // comment is in `listComments`. Sleep briefly and retry once if
             // we don't see a `## Reconciliation` on the first read.
             const reconRe = /^#{2,4}\s*reconciliation\b/im;
+            // fleet-pilot local change 2 (see header): the agent-gh broker
+            // prefixes every body it posts with `[agent-posted] `. Strip that one
+            // leading tag so the heading under it is read as a heading.
+            const unprefix = (b) => (b || '').replace(/^\[agent-posted\][ \t]*/, '');
             const fetchComments = () => github.paginate(
               github.rest.issues.listComments,
               { owner, repo, issue_number, per_page: 100 }
@@ -146,7 +165,7 @@ jobs:
             }
             const stripBodyEarly = (b) =>
               (b || '').replace(/```[\s\S]*?```/g, '').replace(/^>.*$/gm, '');
-            const seemsReconciled = comments.some(c => reconRe.test(stripBodyEarly(c.body)));
+            const seemsReconciled = comments.some(c => reconRe.test(stripBodyEarly(unprefix(c.body))));
             if (!seemsReconciled) {
               await new Promise(r => setTimeout(r, 4000));
               try {
@@ -164,7 +183,16 @@ jobs:
             // shouldn't qualify either.
             const isBot = (c) =>
               (c.user && (c.user.type === 'Bot' || c.user.login === 'github-actions[bot]'));
-            comments = comments.filter(c => !isBot(c));
+            // fleet-pilot local change 2: exactly one App is allowlisted, the
+            // fleet's own identity. Matched on login AND type, so a user account
+            // cannot pass by name alone; every other bot stays filtered.
+            const FLEET_APP_LOGIN = 'acardote-fleet[bot]';
+            const isFleetApp = (c) =>
+              !!(c.user && c.user.login === FLEET_APP_LOGIN && c.user.type === 'Bot');
+            const gateComments = (cs) => cs
+              .filter(c => !isBot(c) || isFleetApp(c))
+              .map(c => ({ ...c, body: unprefix(c.body) }));
+            comments = gateComments(comments);
 
             // Shared by Check 5 and the disposition branch's child check.
             const parentRefRe = /(?:^|\n)\s*\*{0,2}\s*parent\s*\*{0,2}\s*:\s*#(\d+)/i;
@@ -205,7 +233,9 @@ jobs:
                   .replace(/<!--[\s\S]*?(?:-->|$(?![\s\S]))/g, '')
                   .replace(/^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n?[\s\S]*?(?:^[ \t]{0,3}\1[`~]*[ \t]*$|(?![\s\S]))/gm, '')
                   .replace(/^[ \t]{0,3}>.*$/gm, '');
+                // Owner disposition records stay human-only (local change 2).
                 const latestRecord = (cs) => cs
+                  .filter(c => !isFleetApp(c))
                   .filter(c => dispHeadingRe.test(stripRecord(c.body)))
                   .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
 
@@ -233,7 +263,7 @@ jobs:
                   // Same race as S3 (#22): a close with --comment can fire first.
                   await new Promise(r => setTimeout(r, 4000));
                   try {
-                    comments = (await fetchComments()).filter(c => !isBot(c));
+                    comments = gateComments(await fetchComments());
                   } catch (e) {
                     await reopenUnread(e);
                     return;
@@ -485,7 +515,8 @@ jobs:
             // - be the issue creator AND assignees is empty (F1 of #31), OR
             // - the issue carries the `allow-third-party-reconcile`
             //   escape-hatch label.
-            // Bot comments are already filtered upstream.
+            // Bot comments are already filtered upstream, except the
+            // allowlisted fleet App (local change 2).
             let actorOK = !hasReconciliation;
             let actorDetail = '';
             const escapeLabel = labels.includes('allow-third-party-reconcile');
@@ -495,6 +526,9 @@ jobs:
               const assignees = (context.payload.issue.assignees || []).map(a => a.login);
               const issueCreator = context.payload.issue.user && context.payload.issue.user.login;
               if (assignees.includes(author)) {
+                actorOK = true;
+              } else if (isFleetApp(latest)) {
+                // fleet-pilot local change 2: the allowlisted fleet App.
                 actorOK = true;
               } else if (assignees.length === 0 && author === issueCreator) {
                 // F1 mitigation: forgot to self-assign; author == creator is OK.
