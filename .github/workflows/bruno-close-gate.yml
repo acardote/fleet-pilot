@@ -1,23 +1,38 @@
 # Installed from acardote/bruno-method templates/.github/workflows/bruno-close-gate.yml
-# at b0736b364e4e1295a411883d2f95bb49f68285fa. Only change: actions/github-script is
-# pinned to the commit `v7` pointed to at install time (v7.1.0), matching this
-# repo's SHA-pinning convention (ci.yml). Refresh from the template; do not edit
-# the gate logic here (acardote/personal-assistant-ultra#583).
+# at b0736b364e4e1295a411883d2f95bb49f68285fa, with two local changes. A refresh
+# from the template must re-apply both; .github/bruno/test_close_gate.py fails
+# if local change 2 is dropped (acardote/personal-assistant-ultra#583).
+#
+# Local change 1: actions/github-script is pinned to the commit `v7` pointed to
+# at install time (v7.1.0), matching this repo's SHA-pinning convention (ci.yml).
 #
 # Local change 2 (operator decision 2026-11-27,
 # acardote/personal-assistant-ultra#530 comment 7221571981; upstream gap
 # acardote/bruno-method#123): fleet leads post through the agent-gh broker as
 # the App `acardote-fleet[bot]`, and the broker prefixes every body with
-# `[agent-posted] `. So:
+# `[agent-posted] ` on comments AND on the issues it creates. So:
 #   - comments by exactly `acardote-fleet[bot]` (user.type Bot) are kept; every
 #     other bot is still filtered out;
-#   - a leading `[agent-posted]` tag is stripped from comment bodies before the
-#     heading checks, so `[agent-posted] ## Reconciliation (move:5)` counts;
+#   - leading `[agent-posted]` tags (any case, repeated) are stripped from
+#     comment bodies, from this issue's body and from the bodies scanned for
+#     open children, so `[agent-posted] ## Reconciliation (move:5)` and a body
+#     starting `[agent-posted] Parent: #7` count;
 #   - that App passes the reconciliation actor check (a bot login cannot be
 #     permission-checked as a collaborator);
-#   - `## Owner disposition` records stay human-only: the App's are ignored.
+#   - `## Owner disposition` records posted by the App are ignored. This does
+#     not make them human-only: an agent acting under the operator's own login
+#     is indistinguishable from the operator here.
 # Provenance, falsifier, parent-link and label checks are unchanged. Tests:
 # .github/bruno/test_close_gate.py.
+#
+# ACCEPTED RISK (local change 2, operator decision above): every fleet lead
+# shares the one App identity, so there is no author/closer independence for
+# App-posted work. A lead can post the falsifiers and the reconciliation, apply
+# `state:reconciled` and close, on its own issue or another lead's. The checks
+# that remain are structural (a `#N` anywhere near `Provenance` satisfies the
+# provenance check). This extends the honest-author threat model below; the
+# agent-gh broker's access control is the effective boundary for App closes.
+# Trust keys on the App's login string, not its numeric id.
 #
 # Bruno close-gate
 #
@@ -79,7 +94,12 @@ jobs:
             const labels = (context.payload.issue.labels || []).map(l => l.name);
             const isChild = labels.includes('child');
             const isParent = labels.includes('parent');
-            const issueBody = context.payload.issue.body || '';
+            // fleet-pilot local change 2 (see header): the agent-gh broker
+            // prefixes the bodies it posts (comments and created issues) with
+            // `[agent-posted] `. Strip the leading tag(s), any case, so the line
+            // under it is read as a heading or a `Parent:` line.
+            const unprefix = (b) => (b || '').replace(/^(?:[ \t]*\[agent-posted\][ \t]*)+/i, '');
+            const issueBody = unprefix(context.payload.issue.body || '');
 
             // Helper: strip fenced code AND blockquoted lines, applied uniformly.
             const stripBody = (b) =>
@@ -147,10 +167,6 @@ jobs:
             // comment is in `listComments`. Sleep briefly and retry once if
             // we don't see a `## Reconciliation` on the first read.
             const reconRe = /^#{2,4}\s*reconciliation\b/im;
-            // fleet-pilot local change 2 (see header): the agent-gh broker
-            // prefixes every body it posts with `[agent-posted] `. Strip that one
-            // leading tag so the heading under it is read as a heading.
-            const unprefix = (b) => (b || '').replace(/^\[agent-posted\][ \t]*/, '');
             const fetchComments = () => github.paginate(
               github.rest.issues.listComments,
               { owner, repo, issue_number, per_page: 100 }
@@ -464,7 +480,7 @@ jobs:
                     const kids = open
                       .filter(i => !i.pull_request && i.number !== issue_number)
                       .filter(i => {
-                        const m = stripBody(i.body).match(parentRefRe);
+                        const m = stripBody(unprefix(i.body)).match(parentRefRe);
                         return m && parseInt(m[1], 10) === issue_number;
                       })
                       .map(i => `#${i.number}`);

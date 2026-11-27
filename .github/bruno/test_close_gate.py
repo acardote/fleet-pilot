@@ -17,7 +17,11 @@ Covers:
 - the strict checks still fire for the App: no provenance, no
   `state:reconciled`, no falsifiers, no parent link;
 - an App-posted `## Owner disposition` record does not count;
-- a human reconciliation still passes, and the prefix is accepted from a human.
+- a human reconciliation still passes, and the prefix is accepted from a human;
+- the tag is also stripped from the issue body (Parent: and Falsifiers checks)
+  and from the bodies scanned for open children of a disposition-closed parent;
+- repeated and differently cased tags are stripped;
+- the latest reconciliation wins between a human and the App.
 """
 from __future__ import annotations
 
@@ -51,7 +55,8 @@ const core = {
 const err404 = () => { const e = new Error('Not Found'); e.status = 404; return e; };
 const github = {
   paginate: async (fn, params) => fn === github.rest.issues.listComments
-    ? input.comments : [],
+    ? input.comments
+    : fn === github.rest.issues.listForRepo ? (input.open_issues || []) : [],
   rest: {
     issues: {
       listComments: async () => ({ data: input.comments }),
@@ -99,8 +104,9 @@ def gate_script() -> str:
 
 
 def run_gate(issue: dict, comments: list, issues: dict | None = None,
-             permissions: dict | None = None) -> dict:
+             permissions: dict | None = None, open_issues: list | None = None) -> dict:
     payload = {
+        "open_issues": open_issues or [],
         "script": gate_script(),
         "issue": issue,
         "comments": comments,
@@ -235,3 +241,64 @@ def test_app_owner_disposition_does_not_count():
     r = run_gate(issue(["parent", "state:declined"]), [comment(APP, body)])
     assert reopened(r), r
     assert "record comment (non-bot)" in gate_comment(r)
+
+
+# ---- fix-up round: issue bodies, tag variants, ordering ----
+
+def test_tagged_child_body_parent_line_passes():
+    r = run_gate(issue(["child", "state:reconciled"], "[agent-posted] " + CHILD_BODY),
+                 [comment(APP, FALSIFIERS, cid=1), comment(APP, RECON, cid=2)],
+                 issues=PARENT_ISSUES)
+    assert stood(r), r
+
+
+def test_tagged_child_body_falsifiers_heading_passes():
+    body = "[agent-posted] ## Falsifiers\n\n- F1: the gate reopens.\n\nParent: #7\n"
+    r = run_gate(issue(["child", "state:reconciled"], body),
+                 [comment(APP, RECON)], issues=PARENT_ISSUES)
+    assert stood(r), r
+
+
+def test_tagged_child_body_without_parent_still_reopens():
+    r = run_gate(issue(["child", "state:reconciled"], "[agent-posted] Goal: x\n"),
+                 [comment(APP, FALSIFIERS, cid=1), comment(APP, RECON, cid=2)],
+                 issues=PARENT_ISSUES)
+    assert reopened(r), r
+    assert "Parent" in gate_comment(r)
+
+
+@pytest.mark.parametrize("tagged", [True, False])
+def test_disposition_parent_close_sees_open_tagged_child(tagged):
+    record = ("## Owner disposition\n\n- **Disposition:** declined\n"
+              "- **Owner's words:** \"drop it\"\n")
+    child = {"number": 30, "body": ("[agent-posted] " if tagged else "") + "Parent: #18\n\nGoal: x\n"}
+    r = run_gate(issue(["parent", "state:declined"]), [comment(HUMAN, record)],
+                 open_issues=[child])
+    assert reopened(r), r
+    assert "no open children (open: #30)" in gate_comment(r)
+
+
+@pytest.mark.parametrize("prefix", [
+    "[agent-posted] [agent-posted] ",
+    "[Agent-Posted] ",
+    "[AGENT-POSTED]",
+])
+def test_tag_variants_are_stripped(prefix):
+    body = RECON.replace("[agent-posted] ", prefix)
+    r = run_gate(issue(["parent", "state:reconciled"]), [comment(APP, body)])
+    assert stood(r), r
+
+
+def test_latest_reconciliation_wins_app_after_human_without_provenance():
+    human = comment(HUMAN, "## Reconciliation\n\nnothing\n", created="2026-11-27T09:00:00Z", cid=1)
+    app = comment(APP, RECON, created="2026-11-27T10:00:00Z", cid=2)
+    r = run_gate(issue(["parent", "state:reconciled"]), [human, app])
+    assert stood(r), r
+
+
+def test_latest_reconciliation_wins_human_after_app_without_provenance():
+    app = comment(APP, RECON, created="2026-11-27T09:00:00Z", cid=1)
+    human = comment(HUMAN, "## Reconciliation\n\nnothing\n", created="2026-11-27T10:00:00Z", cid=2)
+    r = run_gate(issue(["parent", "state:reconciled"]), [app, human])
+    assert reopened(r), r
+    assert "Provenance" in gate_comment(r)
