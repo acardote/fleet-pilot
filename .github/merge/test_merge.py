@@ -1270,13 +1270,81 @@ def test_policy_refusal_while_check_is_recreated_is_retried_in_run(origin, capsy
     assert "RUN-RESULT merged=1 skipped=0 error=0 refused=0" in out
 
 
-def test_policy_refusal_with_settled_unchanged_check_is_other_and_not_retried(origin, capsys):
+def test_policy_refusal_with_settled_check_waits_retries_once_and_merges(origin, capsys):
+    """ee-fleet-pilot#11 / run 46070064439: step 7 read the check as success (waited=0s), but
+    GitHub's merge policy had not seen it yet. The refusal is check-stale, so the run pauses
+    POLICY_SETTLE_S, re-reads the check, re-verifies, re-reads the labels and head, and merges."""
     h = origin.heads[1]
-    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG)])
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG), (True, "")])
+    assert r.run("true") == 0
+    out = capsys.readouterr().out
+    assert merges == [(REPO, 1, h, "squash")] * 2  # both calls pinned to H (--match-head-commit)
+    assert clock.sleeps == [m.POLICY_SETTLE_S] and m.POLICY_SETTLE_S == 15
+    assert f"MERGE-RETRY pr=1 head={h} kind=check-stale wait=15s" in out
+    assert "MERGE-REFUSED" not in out
+    assert out.count(f"CHECK-WAIT pr=1 head={h} state=success") == 2  # step 7 re-read before the retry
+    assert f"RE-VERIFY pr=1 head={h} attempt=2" in out
+    v, mg = contract_lines(out, 1, h)
+    assert v == [f"VERDICT-RECOMPUTED pr=1 head={h} result=pass"] * 2
+    assert mg == [f"MERGED pr=1 head={h} run_id=4242 workflow_ref={REF}"]
+    assert "RUN-RESULT merged=1 skipped=0 error=0 refused=0" in out
+
+
+def test_policy_refusal_twice_is_refused_not_looped(origin, capsys):
+    h = origin.heads[1]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG), (False, POLICY_MSG)])
     assert r.run("true") == 1
     out = capsys.readouterr().out
-    assert len(merges) == 1 and "MERGE-RETRY" not in out
+    assert len(merges) == 2 and out.count("MERGE-RETRY") == 1 and clock.sleeps == [15]
+    assert f"MERGE-REFUSED pr=1 head={h} kind=check-stale" in out
+    assert not any(x.startswith("MERGED") for x in out.splitlines())
+    assert "RUN-RESULT merged=0 skipped=0 error=0 refused=1" in out
+
+
+def test_other_refusal_is_not_retried(origin, capsys):
+    h = origin.heads[1]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(False, "GraphQL: Pull Request is not mergeable")])
+    assert r.run("true") == 1
+    out = capsys.readouterr().out
+    assert len(merges) == 1 and "MERGE-RETRY" not in out and clock.sleeps == []
     assert f"MERGE-REFUSED pr=1 head={h} kind=other" in out
+
+
+def test_head_moved_during_the_policy_wait_blocks_the_retry(origin, capsys):
+    h = origin.heads[1]
+    r, merges, _ = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG)])
+    reads = {"n": 0}
+    orig = r.gh.get
+
+    def get(path):
+        res = orig(path)
+        if path == f"repos/{REPO}/pulls/1":
+            reads["n"] += 1
+            if reads["n"] > 3:  # initial read, step 6 re-read, failed-merge re-read; then moved
+                res = dict(res, head=dict(res["head"], sha="f" * 40))
+        return res
+    r.gh.get = get
+    r.run("true")
+    out = capsys.readouterr().out
+    assert len(merges) == 1 and "MERGE-RETRY" in out
+    assert not any(x.startswith("MERGED") for x in out.splitlines())
+
+
+def test_run_deadline_during_the_policy_wait_blocks_the_retry(origin, capsys):
+    """AUTO_MERGE_ENABLED cannot be re-read in-run (GITHUB_TOKEN has no Variables permission); the
+    run-deadline check before every merge call bounds its latency, and it applies to the retry too."""
+    h = origin.heads[1]
+    r, merges, clock = race_runner(origin, [pr_obj(1, h)], [(False, POLICY_MSG)])
+
+    def slow_sleep(s):  # the policy pause lands past the run deadline
+        clock.sleeps.append(s)
+        clock.t += m.RUN_DEADLINE_S + 1
+    r.sleep = slow_sleep
+    r.run("true")
+    out = capsys.readouterr().out
+    assert len(merges) == 1 and "MERGE-RETRY" in out
+    assert not any(x.startswith("MERGED") for x in out.splitlines())
+    assert f"SKIP pr=1 head={h}" in out and "run deadline 600s reached before the merge call" in out
 
 
 def test_retry_refused_again_is_logged_check_stale_and_red(origin, capsys):
