@@ -34,7 +34,7 @@ The verdict also works out an objective weight from the diff and never accepts a
 |---|---|
 | `trivial` | at most 49 changed lines (additions plus deletions) and 1 file |
 | `standard` | more than 49 changed lines, or more than 1 file, and at most 500 changed lines |
-| `heavy` | more than 500 changed lines; or any changed file on the security-boundary list (`heavy_paths`); or a changed symlink or submodule; or any added or modified file with no patch and 0 changed lines (a binary file, a mode-only change, a pure rename, an empty new file); or any symlink anywhere in the tree at a `heavy_paths` location |
+| `heavy` | more than 500 changed lines; or any changed file on the security-boundary list (`heavy_paths`); or a changed symlink or submodule; or any file that is not removed and has no patch and 0 changed lines (a binary file, a mode-only change, a pure rename, an empty new file); or any symlink anywhere in the tree at a `heavy_paths` location |
 
 A rename counts both the old and the new path, so a one-file rename is at least `standard`, and a rename with no edits is `heavy`. `heavy_paths` is matched case-insensitively after Unicode normalisation. One pattern there, `**/*lock*`, matches any file with "lock" in its name (for example `clock.py`); the same pattern is also in the 7a floor list, so such a PR never auto-merges either.
 
