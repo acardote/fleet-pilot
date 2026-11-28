@@ -1015,7 +1015,8 @@ def test_tampered_state_content_fails_closed():
 def test_a_gap_since_the_previous_run_is_flagged():
     """wario I3: a disable-act-re-enable window shows as a gap."""
     state, _ = first_state()
-    a = au.Auditor(FakeGH(second_world(state)), REPO, CFG, now=datetime(2026, 11, 27, 13, 30, tzinfo=timezone.utc))
+    # hourly schedule (47 * * * *): max_gap_minutes is 90, so two hours since the previous run is a gap
+    a = au.Auditor(FakeGH(second_world(state)), REPO, CFG, now=datetime(2026, 11, 27, 14, 0, tzinfo=timezone.utc))
     anchor = au.parse_anchor(au.find_issue(a.gh, REPO, CFG)[1])
     au.load_state(a.gh, REPO, CFG, env(), anchor, a)
     assert rules_of(a) == ["R6:gap"]
@@ -1203,7 +1204,7 @@ def test_record_regexes_match_verdict():
 
 
 def test_config_has_no_dead_keys():
-    assert "initial_commit_limit" not in CFG and CFG["max_gap_minutes"] < 60
+    assert "initial_commit_limit" not in CFG and CFG["max_gap_minutes"] < 120  # hourly schedule (47 * * * *) plus GitHub schedule delay
 
 
 def wf_text():
@@ -1604,14 +1605,15 @@ def test_records_review_reads_have_their_own_cap():
     assert "R7:records-backlog" in a.conditions
 
 
-def test_an_r5_backlog_older_than_30_minutes_flags_the_oldest_run():
-    """verify5: the evidence (run id, actor) survives a later deletion of that run."""
-    runs = [dict(run_rec(i, sha=D1), created_at="2026-11-27T11:10:00Z") for i in range(1, 4)]
+def test_an_r5_backlog_older_than_90_minutes_flags_the_oldest_run():
+    """verify5: the evidence (run id, actor) survives a later deletion of that run.
+    backlog_age_flag_minutes is 90 for the hourly audit schedule."""
+    runs = [dict(run_rec(i, sha=D1), created_at="2026-11-27T10:10:00Z") for i in range(1, 4)]
     a = auditor(world(**{f"repos/{REPO}/actions/runs": {"workflow_runs": runs}, f"repos/{REPO}/git/trees/{D1}": tree(WF_BLOBS)}))
     a.call_limit = a.gh.count + 3
     a.foreign_runs({"id": 0, "at": "2026-11-27T11:00:00Z"}, {"runs": 0})
     f = [x for x in a.findings if x["key"].startswith("R5:run-unchecked:")]
-    assert len(f) == 1 and "actor 'acardote'" in f[0]["summary"] and "50 min" in f[0]["summary"]
+    assert len(f) == 1 and "actor 'acardote'" in f[0]["summary"] and "110 min" in f[0]["summary"]
 
 
 # ---------------------------------------------------------------- live bug: empty pull_requests[] (N2 residual)

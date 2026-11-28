@@ -67,7 +67,7 @@ def test_triggers_are_default_branch_only(wf):
     assert set(wf["on"].keys()) == {"pull_request_target", "schedule"}
     assert wf["on"]["pull_request_target"]["branches"] == ["main"]
     assert set(wf["on"]["pull_request_target"]["types"]) == {"labeled", "synchronize"}
-    assert wf["on"]["schedule"] == [{"cron": "*/5 * * * *"}]
+    assert wf["on"]["schedule"] == [{"cron": "17 * * * *"}]
 
 
 @pytest.mark.parametrize("bad", ["push", "pull_request", "workflow_dispatch", "workflow_run",
