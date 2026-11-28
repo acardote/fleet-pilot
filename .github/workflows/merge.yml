@@ -26,7 +26,7 @@ on:
     types: [labeled, synchronize]
     branches: [main]
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "17 * * * *"
 
 permissions: {}
 

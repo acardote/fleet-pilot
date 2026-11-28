@@ -36,7 +36,7 @@
   "max_range_commits": 3000,
   "time_budget_seconds": 600,
   "max_pending_minutes": 120,
-  "max_gap_minutes": 50,
+  "max_gap_minutes": 90,
   "max_issue_event_pages": 10,
   "max_record_pages": 10,
   "record_verify_per_run": 30,
@@ -44,6 +44,7 @@
   "max_branch_pages": 10,
   "chain_keep": 100,
   "accepted_previous_code": [
+    "aaf4b8223b338093aad9a484f0b2a850f2c40e714b0f320582849d4031da7dce",
     "98a17784a59aac9499b56fbd005a4c64b726ade5f80f70d1a7511b3c59b6c2e2"
   ],
   "public_vars": [
@@ -61,5 +62,5 @@
   "backlog_flag_after": 3,
   "retired_workflow_blobs": [],
   "records_review_reads_per_run": 40,
-  "backlog_age_flag_minutes": 30
+  "backlog_age_flag_minutes": 90
 }
